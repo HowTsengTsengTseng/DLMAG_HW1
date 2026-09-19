@@ -1,0 +1,23 @@
+[project]
+name = "music-era-market-mert"
+version = "0.1.0"
+description = "Homework 1: frozen MERT-v2 + MLP for decade and release-market classification"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+  "torch==2.6.0",
+  "torchaudio==2.6.0",
+  "transformers==4.53.2",
+  "huggingface-hub>=0.33,<1",
+  "safetensors>=0.5,<1",
+  "soundfile>=0.13,<0.14",
+  "numpy>=1.26,<3",
+  "scikit-learn>=1.5,<2",
+  "matplotlib>=3.9,<4",
+  "gdown==5.2.0",
+  "python-dotenv>=1,<2",
+  "tqdm>=4.67,<5",
+]
+[dependency-groups]
+notebooks = ["jupyterlab>=4,<5", "ipykernel>=6,<7"]
+[tool.uv]
+package = false
