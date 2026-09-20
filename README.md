@@ -53,8 +53,19 @@ uv run python dataset.py download --output data/raw
 
 此指令以 gdown 下載使用者指定的 [Drive 資料夾](https://drive.google.com/drive/folders/1C8RymiLbr-EGmkxh2Ap5TIybnJYqNsb4)，解壓縮兩個 ZIP，保留原始檔。公開目錄目前列出 `dataset_A.zip`、`dataset_B.zip`、`prediction_format_example_NOT_ANSWERS.json`；ZIP 合計約 3 GB。配額或權限問題會直接回報失敗，不會略過遺漏檔案。
 
-**ZIP 內部目錄與 CSV 欄位尚未下載核對。** 因此程式使用明確的 manifest 介面，而不猜測內部 schema。下載後以官方 split/label 檔產生下列六個 CSV；不可自行重新隨機切分、以範例 prediction JSON 充當標籤、或從 test 取得訓練標籤。
+**資料結構已完成核對：**
+下載解壓縮後，官方檔案包含：
+- `data/raw/dataset_A/manifest.csv` 與 `data/raw/dataset_A/audio/*.wav` (A 共有 1026 train / 132 validation / 132 test)
+- `data/raw/dataset_B/manifest.csv` 與 `data/raw/dataset_B/audio/*.wav` (B 共有 798 train / 102 validation / 102 test)
+- 欄位包含 `sample_id`, `split`, `label`, `audio_path`, `duration_seconds`, `sample_rate`, `sha256`。
 
+可執行以下一鍵指令，自動從 raw 資料產生繳交所需的六個標準 split CSV：
+
+```bash
+uv run python dataset.py prepare-all
+```
+
+產生清單：
 ```text
 data/manifests/A_train.csv
 data/manifests/A_validation.csv
@@ -65,31 +76,14 @@ data/manifests/B_test.csv
 ```
 
 每個 manifest 的格式：
-
 ```csv
 sample_id,path,label
 <官方ID>,<相對於data-root的WAV路徑>,<官方標籤>
 ```
 
-`sample_id` 必須保留官方字串，不能加入副檔名；`path` 可以是相對 `--data-root` 的路徑或絕對路徑。為方便助教換機器，建議使用相對路徑。Test 只需 `sample_id,path`；即使有 label 欄位也不會用來評分或訓練。
-
-若官方資料為 CSV，可使用欄位轉換器。例如以下 `official.csv`、欄名及 split 值都要換成下載後的真實值：
-
-```bash
-uv run python dataset.py prepare \
-  --source data/raw/official.csv --data-root data/raw \
-  --task A --split train --split-column split --split-value train \
-  --id-column sample_id --path-column path --label-column label \
-  --output data/manifests/A_train.csv
-```
-
-若官方每個 split 各一份 CSV，省略 `--split-column` 與 `--split-value`。對 A／B 的 train、validation、test 分別轉換。轉換器不重新切分資料、不推測數字 label 對照；若來源是數字，必須依官方 mapping 轉成下列字串。
-
-- A：`1960s, 1970s, 1980s, 1990s, 2000s, 2010s`。
-- B：`US, UK, Brazil, Spain, Germany, Italy`。市場不是歌手國籍或歌曲語言。
-- PDF 列出的 train / validation / test 數量：A 為 1026 / 132 / 132；B 為 798 / 102 / 102。請在下載後比對。
-
-讀取 manifest 時檢查重複 ID、重複音訊路徑、檔案存在與合法 label。訓練另檢查 train/validation 不重疊；保留官方 artist-disjoint 切分，不嘗試從匿名 ID 推論 artist。
+- A 標籤：`1960s, 1970s, 1980s, 1990s, 2000s, 2010s`。
+- B 標籤：`US, UK, Brazil, Spain, Germany, Italy`。
+- 數量核對完全符合：A 為 1026 / 132 / 132；B 為 798 / 102 / 102。
 
 ## 架構與前處理
 
@@ -106,10 +100,18 @@ WAV → mono → 24 kHz → 中央最多30秒
 
 每個任務的 mean/std **只在 train features 估計**，並存成 MLP buffer。Validation 只用於 early stopping／選擇最佳 validation loss，不做梯度更新。Test 完全不參與 model selection。此版本只訓練 MLP，不做 MERT fine-tuning。
 
-## 未來執行訓練
+## 執行訓練
 
-以下指令尚未執行：
+訓練腳本已自動支援官方 raw manifests 與標準化 manifests。以下兩種指令皆可執行：
 
+### 方式一：直接使用官方 raw manifest（最簡潔，自動切分 train/validation）
+```bash
+uv run python train.py --task A --output-dir runs/A
+uv run python train.py --task B --output-dir runs/B
+```
+*(腳本會自動讀取 `data/raw/dataset_A/manifest.csv` 與 `data/raw/dataset_B/manifest.csv` 並依 `split` 欄位篩選)*
+
+### 方式二：使用個別 manifest（相容官方標準切分檔）
 ```bash
 uv run python train.py --task A --data-root data/raw \
   --train-manifest data/manifests/A_train.csv \

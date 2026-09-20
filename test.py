@@ -13,9 +13,9 @@ from utils import LABELS, get_device, save_json
 def main():
     load_dotenv()
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data-root", required=True, help="Audio root on the grader's device")
-    parser.add_argument("--manifest-a", required=True)
-    parser.add_argument("--manifest-b", required=True)
+    parser.add_argument("--data-root", default="data/raw", help="Audio root on the grader's device (default: data/raw)")
+    parser.add_argument("--manifest-a", help="Manifest for task A (defaults to data/raw/dataset_A/manifest.csv or data/manifests/A_test.csv)")
+    parser.add_argument("--manifest-b", help="Manifest for task B (defaults to data/raw/dataset_B/manifest.csv or data/manifests/B_test.csv)")
     parser.add_argument("--checkpoint-a", required=True)
     parser.add_argument("--checkpoint-b", required=True)
     parser.add_argument("--output", required=True, help="e.g. predictions/b13902135.json")
@@ -24,6 +24,22 @@ def main():
     parser.add_argument("--extract-batch-size", type=int, default=1)
     parser.add_argument("--template", help="Optional official format JSON; validate sample IDs only, never use example answers")
     args = parser.parse_args()
+    if not args.manifest_a:
+        from pathlib import Path
+        for p in ["data/manifests/A_test.csv", f"{args.data_root}/dataset_A/manifest.csv"]:
+            if Path(p).exists():
+                args.manifest_a = p
+                break
+        if not args.manifest_a:
+            parser.error("Cannot find default manifest for task A; please provide --manifest-a")
+    if not args.manifest_b:
+        from pathlib import Path
+        for p in ["data/manifests/B_test.csv", f"{args.data_root}/dataset_B/manifest.csv"]:
+            if Path(p).exists():
+                args.manifest_b = p
+                break
+        if not args.manifest_b:
+            parser.error("Cannot find default manifest for task B; please provide --manifest-b")
     device = get_device(args.device)
     predictions = {}
     encoder, encoder_key = None, None

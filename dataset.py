@@ -16,28 +16,61 @@ from utils import LABELS
 DRIVE_URL = "https://drive.google.com/drive/folders/1C8RymiLbr-EGmkxh2Ap5TIybnJYqNsb4"
 
 
+def resolve_audio_path(root, manifest_path, raw_path, task):
+    raw_p = Path(raw_path)
+    if raw_p.is_absolute() and raw_p.is_file():
+        return raw_p.resolve()
+    candidates = [
+        Path(root) / raw_p,
+        Path(root) / f"dataset_{task}" / raw_p,
+        Path(manifest_path).parent / raw_p,
+        Path(manifest_path).parent / f"dataset_{task}" / raw_p,
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.resolve()
+    return (Path(root) / raw_p).resolve()
+
+
 def read_manifest(path, root, task, split):
-    with Path(path).open(newline="", encoding="utf-8-sig") as f:
+    path = Path(path)
+    with path.open(newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
-        if not {"sample_id", "path"}.issubset(reader.fieldnames or []):
-            raise ValueError(f"{path}: required columns: sample_id,path,label (label optional for test)")
-        rows = list(reader)
-    if not rows:
+        fields = set(reader.fieldnames or [])
+        path_col = None
+        for candidate in ["path", "audio_path"]:
+            if candidate in fields:
+                path_col = candidate
+                break
+        if "sample_id" not in fields or path_col is None:
+            raise ValueError(f"{path}: required columns: sample_id and either path or audio_path")
+        has_split_col = "split" in fields
+        raw_rows = list(reader)
+
+    if not raw_rows:
         raise ValueError(f"Empty manifest: {path}")
+
+    rows = []
     ids, paths = set(), set()
-    for row in rows:
+    for row in raw_rows:
+        if has_split_col and row["split"].strip() != split:
+            continue
         sid = row["sample_id"].strip()
-        audio = (Path(root) / row["path"]).resolve()
+        audio = resolve_audio_path(root, path, row[path_col].strip(), task)
         label = (row.get("label") or "").strip()
         if not sid or sid in ids or audio in paths:
             raise ValueError(f"Empty/duplicate ID or duplicate audio path: {sid}")
         if not audio.is_file():
-            raise FileNotFoundError(audio)
+            raise FileNotFoundError(f"Audio file not found: {audio}")
         if split != "test" and label not in LABELS[task]:
             raise ValueError(f"Invalid {task} label {label!r} for {sid}; expected {LABELS[task]}")
         row.update(sample_id=sid, path=str(audio), label=label)
         ids.add(sid)
         paths.add(audio)
+        rows.append(row)
+
+    if not rows:
+        raise ValueError(f"No rows matching split {split!r} in manifest: {path}")
     return rows
 
 
@@ -123,6 +156,42 @@ def convert_manifest(args):
     print(f"Saved {len(rows)} rows to {destination}")
 
 
+def prepare_all_manifests(data_root="data/raw", output_dir="data/manifests"):
+    """Export canonical manifests for all tasks and splits from raw dataset manifests."""
+    data_root = Path(data_root)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    generated = []
+    for task in ["A", "B"]:
+        source = data_root / f"dataset_{task}" / "manifest.csv"
+        if not source.exists():
+            print(f"Skipping task {task}: {source} not found")
+            continue
+        with source.open(newline="", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            fields = set(reader.fieldnames or [])
+            path_col = "path" if "path" in fields else "audio_path"
+            rows = list(reader)
+        for split in ["train", "validation", "test"]:
+            split_rows = []
+            for r in rows:
+                if r.get("split", "").strip() != split:
+                    continue
+                audio_p = r[path_col].strip()
+                rel_path = f"dataset_{task}/{audio_p}" if not audio_p.startswith(f"dataset_{task}/") else audio_p
+                label = r.get("label", "").strip() if split != "test" else ""
+                split_rows.append({"sample_id": r["sample_id"].strip(), "path": rel_path, "label": label})
+            dest = output_dir / f"{task}_{split}.csv"
+            with dest.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=["sample_id", "path", "label"])
+                writer.writeheader()
+                writer.writerows(split_rows)
+            read_manifest(dest, data_root, task, split)
+            generated.append(dest)
+            print(f"Generated {dest} ({len(split_rows)} rows)")
+    return generated
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -139,9 +208,14 @@ def main():
     convert.add_argument("--label-column", default="label")
     convert.add_argument("--split-column")
     convert.add_argument("--split-value")
+    prep_all = sub.add_parser("prepare-all", help="Generate all 6 canonical manifests from data/raw")
+    prep_all.add_argument("--data-root", default="data/raw")
+    prep_all.add_argument("--output-dir", default="data/manifests")
     args = parser.parse_args()
     if args.command == "download":
         download_dataset(args.output)
+    elif args.command == "prepare-all":
+        prepare_all_manifests(args.data_root, args.output_dir)
     else:
         convert_manifest(args)
 

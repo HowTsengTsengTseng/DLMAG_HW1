@@ -17,9 +17,10 @@ def main():
     load_dotenv()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--task", required=True, choices=LABELS)
-    parser.add_argument("--data-root", required=True)
-    parser.add_argument("--train-manifest", required=True)
-    parser.add_argument("--val-manifest", required=True)
+    parser.add_argument("--data-root", default="data/raw", help="Root directory containing datasets (default: data/raw)")
+    parser.add_argument("--manifest", help="Combined manifest CSV (e.g. data/raw/dataset_A/manifest.csv); auto-filters splits")
+    parser.add_argument("--train-manifest", help="Train manifest CSV (defaults to --manifest)")
+    parser.add_argument("--val-manifest", help="Validation manifest CSV (defaults to --manifest)")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--cache-dir", default="data/features")
     parser.add_argument("--model-id", default=MODEL_ID)
@@ -36,6 +37,18 @@ def main():
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
+    if args.manifest:
+        if not args.train_manifest:
+            args.train_manifest = args.manifest
+        if not args.val_manifest:
+            args.val_manifest = args.manifest
+    elif not (args.train_manifest and args.val_manifest):
+        default_manifest = Path(args.data_root) / f"dataset_{args.task}" / "manifest.csv"
+        if default_manifest.exists():
+            args.train_manifest = str(default_manifest)
+            args.val_manifest = str(default_manifest)
+        else:
+            parser.error("Must provide --manifest, both --train-manifest and --val-manifest, or have data/raw/dataset_{task}/manifest.csv")
     if min(args.epochs, args.patience, args.batch_size, args.hidden_dim) < 1:
         parser.error("epochs, patience, batch-size and hidden-dim must be positive")
     if args.lr <= 0 or args.weight_decay < 0 or not 0 <= args.dropout < 1:
