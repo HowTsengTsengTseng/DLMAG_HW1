@@ -6,8 +6,11 @@
 
 ```text
 models.py                 MERT encoder、標準化與 MLP
-train.py                  特徵擷取、MLP 訓練、validation 與最佳 checkpoint
-test.py                  兩個任務的 test 推論與作業 JSON（不是單元測試）
+train/                    訓練腳本目錄
+  train.py                標準 Cross-Entropy 訓練
+  train_contrastive.py    Supervised Contrastive (SupCon) + CE 訓練
+train.py                  根目錄捷徑訓練腳本
+test.py                   兩個任務的 test 推論與作業 JSON（不是單元測試）
 dataset.py                gdown 下載、安全解壓縮、manifest 轉換與音訊讀取
 features.py               依音訊內容與模型版本建立特徵快取
 utils.py                  標籤、random seed、metrics、混淆矩陣
@@ -113,14 +116,24 @@ uv run python train.py --task B --output-dir runs/B
 
 ### 方式二：使用個別 manifest（相容官方標準切分檔）
 ```bash
-uv run python train.py --task A --data-root data/raw \
+uv run python train/train.py --task A --data-root data/raw \
   --train-manifest data/manifests/A_train.csv \
   --val-manifest data/manifests/A_validation.csv --output-dir runs/A
 
-uv run python train.py --task B --data-root data/raw \
+uv run python train/train.py --task B --data-root data/raw \
   --train-manifest data/manifests/B_train.csv \
   --val-manifest data/manifests/B_validation.csv --output-dir runs/B
 ```
+
+### 方式三：使用對比學習訓練（Supervised Contrastive Learning, SupCon）
+```bash
+uv run python train/train_contrastive.py --task A --output-dir runs/A_contrastive \
+  --contrastive-weight 0.5 --temperature 0.1
+
+uv run python train/train_contrastive.py --task B --output-dir runs/B_contrastive \
+  --contrastive-weight 0.5 --temperature 0.1
+```
+*(以 SupCon 損失將同一年代/類別的歌曲在超球面上拉近、不同類別推遠。儲存的 `best.pt` Checkpoint 完全相容於 `test.py` 推論)*
 
 預設 AdamW、lr=0.001、weight decay=0.0001、batch size=64、最多100 epochs、patience=15、seed=42。輸出 `best.pt`、`config.json`、`history.json`、`validation_metrics.json`、`validation_confusion.png`。混淆矩陣是 counts，列為真實類別、欄為預測類別；Top-1／Top-3 是 0 到 1 的比例。固定 seed 仍可能因裝置／底層運算差異產生數值差異。
 

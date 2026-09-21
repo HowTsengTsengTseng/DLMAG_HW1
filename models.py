@@ -49,6 +49,12 @@ class MLPClassifier(nn.Module):
         self.feature_mean.copy_(training_features.mean(0))
         self.feature_std.copy_(training_features.std(0, unbiased=False).clamp_min(1e-6))
 
-    def forward(self, features):
+    def forward(self, features, return_embedding=False):
         standardized = (features - self.feature_mean) / self.feature_std
-        return self.network(F.normalize(standardized, p=2, dim=-1))
+        normed = F.normalize(standardized, p=2, dim=-1)
+        # Pass through Linear -> GELU -> Dropout
+        hidden = self.network[2](self.network[1](self.network[0](normed)))
+        logits = self.network[3](hidden)
+        if return_embedding:
+            return logits, F.normalize(hidden, p=2, dim=-1)
+        return logits
