@@ -49,12 +49,22 @@ class MLPClassifier(nn.Module):
         self.feature_mean.copy_(training_features.mean(0))
         self.feature_std.copy_(training_features.std(0, unbiased=False).clamp_min(1e-6))
 
-    def forward(self, features, return_embedding=False):
+    def encode(self, features):
         standardized = (features - self.feature_mean) / self.feature_std
         normed = F.normalize(standardized, p=2, dim=-1)
-        # Pass through Linear -> GELU -> Dropout
         hidden = self.network[2](self.network[1](self.network[0](normed)))
-        logits = self.network[3](hidden)
+        return F.normalize(hidden, p=2, dim=-1)
+
+    @torch.no_grad()
+    def set_prototypes(self, prototypes, temperature=0.1):
+        """Set linear layer weights to temperature-scaled contrastive class prototypes."""
+        normed_prototypes = F.normalize(prototypes, p=2, dim=-1)
+        self.network[3].weight.copy_(normed_prototypes / temperature)
+        self.network[3].bias.zero_()
+
+    def forward(self, features, return_embedding=False):
+        z = self.encode(features)
+        logits = self.network[3](z)
         if return_embedding:
-            return logits, F.normalize(hidden, p=2, dim=-1)
+            return logits, z
         return logits

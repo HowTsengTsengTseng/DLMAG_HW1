@@ -1,4 +1,16 @@
-"""Fit one task-specific MLP using Supervised Contrastive Loss (SupCon) and Cross-Entropy."""
+"""Fit one task-specific encoder and predict PURELY based on Era Contrastive (EC) Loss.
+
+Training:
+  - Optimizes the encoder solely using Supervised Contrastive Loss (Audio-SUC EC Loss, Eq. 3 in paper).
+  - No Cross-Entropy loss is computed or backpropagated during training.
+
+Prediction:
+  - Class prototypes (mean embeddings on the unit hypersphere) are computed for each class/era.
+  - Test/Validation predictions are made purely by ranking cosine similarities between query embeddings
+    and class prototypes: score(x, c) = (z_x . w_c) / tau.
+  - The final linear layer weights are fixed to these prototypes so that checkpoints remain 100% compatible
+    with test.py inference.
+"""
 import argparse
 from pathlib import Path
 import sys
@@ -18,11 +30,11 @@ from models import MERTEncoder, MLPClassifier
 from utils import LABELS, MODEL_ID, get_device, metrics, save_confusion, save_json, seed_everything
 
 
-class SupervisedContrastiveLoss(nn.Module):
-    """Supervised Contrastive Learning (SupCon, Khosla et al. 2020 / Audio-SUC EC Loss).
+class EraContrastiveLoss(nn.Module):
+    """Supervised Era Contrastive (EC) Loss (Eq. 3 in He et al., 2024 / Khosla et al., 2020).
 
-    Pulls representations of songs belonging to the same era/class closer together
-    while pushing apart representations from different classes on the unit hypersphere.
+    Forces embeddings belonging to the same era class to be pulled together on the unit
+    hypersphere while pushing apart embeddings from different era classes.
     """
     def __init__(self, temperature: float = 0.1):
         super().__init__()
@@ -33,13 +45,11 @@ class SupervisedContrastiveLoss(nn.Module):
         if batch_size <= 1:
             return torch.tensor(0.0, device=embeddings.device, requires_grad=True)
 
-        # Ensure unit L2 normalization
+        # Embeddings are on the unit hypersphere: z_i . z_j is exact cosine similarity
         embeddings = F.normalize(embeddings, p=2, dim=-1)
-
-        # Dot product / cosine similarity matrix scaled by temperature
         sim = torch.matmul(embeddings, embeddings.T) / self.temperature
 
-        # For numerical stability, subtract row-wise max
+        # Subtract row-wise max for numerical stability
         logits_max, _ = torch.max(sim, dim=1, keepdim=True)
         logits = sim - logits_max.detach()
 
@@ -49,11 +59,11 @@ class SupervisedContrastiveLoss(nn.Module):
         # Mask for positive pairs (same label, excluding self)
         label_mask = torch.eq(labels.unsqueeze(1), labels.unsqueeze(0)).float() * logits_mask
 
-        # Log-probability: log(exp(sim_ij / tau) / sum_{k != i} exp(sim_ik / tau))
+        # Log-probability: log [ exp(sim_ij / tau) / sum_{k != i} exp(sim_ik / tau) ]
         exp_logits = torch.exp(logits) * logits_mask
         log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True).clamp_min(1e-12))
 
-        # Mean log probability over positive samples for anchors that have at least one positive
+        # Mean over positive pairs for each anchor that has at least one positive
         pos_count = label_mask.sum(1)
         valid_anchors = pos_count > 0
         if not valid_anchors.any():
@@ -62,6 +72,18 @@ class SupervisedContrastiveLoss(nn.Module):
         mean_log_prob_pos = (label_mask * log_prob).sum(1) / pos_count.clamp_min(1.0)
         loss = -mean_log_prob_pos[valid_anchors].mean()
         return loss
+
+
+@torch.no_grad()
+def compute_class_prototypes(embeddings: torch.Tensor, labels: torch.Tensor, num_classes: int) -> torch.Tensor:
+    """Compute unit-normalized mean centroid (prototype) for each class in contrastive space."""
+    prototypes = torch.zeros((num_classes, embeddings.shape[1]), device=embeddings.device)
+    for c in range(num_classes):
+        mask = (labels == c)
+        if mask.any():
+            class_mean = embeddings[mask].mean(dim=0)
+            prototypes[c] = F.normalize(class_mean, p=2, dim=-1)
+    return prototypes
 
 
 def main():
@@ -87,11 +109,9 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=42)
-    # Contrastive learning hyperparameters
-    parser.add_argument("--contrastive-weight", "--beta", type=float, default=0.5,
-                        help="Weight beta for contrastive loss: L = L_CE + beta * L_SupCon (default: 0.5)")
+    # EC contrastive loss temperature parameter
     parser.add_argument("--temperature", "--tau", type=float, default=0.1,
-                        help="Temperature tau for contrastive loss (default: 0.1)")
+                        help="Temperature tau for EC contrastive loss (default: 0.1)")
     args = parser.parse_args()
 
     if args.manifest:
@@ -111,15 +131,15 @@ def main():
         parser.error("epochs, patience, batch-size and hidden-dim must be positive")
     if args.lr <= 0 or args.weight_decay < 0 or not 0 <= args.dropout < 1:
         parser.error("Invalid optimizer or dropout parameters")
-    if args.contrastive_weight < 0 or args.temperature <= 0:
-        parser.error("contrastive-weight must be non-negative and temperature must be positive")
+    if args.temperature <= 0:
+        parser.error("temperature must be positive")
 
     seed_everything(args.seed)
     device = get_device(args.device)
     output = Path(args.output_dir)
     output.mkdir(parents=True, exist_ok=True)
 
-    # Prevent accidental reuse/overwrite of an existing run.
+    # Prevent accidental overwrite of an existing run
     if (output / "best.pt").exists():
         raise FileExistsError(f"Choose a new output directory: {output / 'best.pt'} exists")
 
@@ -127,6 +147,7 @@ def main():
     val_rows = read_manifest(args.val_manifest, args.data_root, args.task, "validation")
     check_disjoint(train_rows, val_rows)
     labels = LABELS[args.task]
+    num_classes = len(labels)
     if {r["label"] for r in train_rows} != set(labels):
         raise ValueError("Training split must contain all six task labels")
 
@@ -141,66 +162,78 @@ def main():
     x_train, x_val = features
     y_train, y_val = [torch.tensor([labels.index(r["label"]) for r in rows]) for rows in (train_rows, val_rows)]
 
-    model_args = dict(input_dim=input_dim, hidden_dim=args.hidden_dim, num_classes=len(labels), dropout=args.dropout)
+    model_args = dict(input_dim=input_dim, hidden_dim=args.hidden_dim, num_classes=num_classes, dropout=args.dropout)
     model = MLPClassifier(**model_args)
-    model.fit_standardizer(x_train)  # Training samples only; buffers travel in the checkpoint.
+    model.fit_standardizer(x_train)
     model.to(device)
 
-    criterion_supcon = SupervisedContrastiveLoss(temperature=args.temperature)
+    # Pure EC loss criterion
+    criterion_ec = EraContrastiveLoss(temperature=args.temperature)
+
+    # Only train the encoder projection head (network[:3]). The final classifier weights (network[3])
+    # are set directly by the contrastive prototypes.
+    encoder_params = list(model.network[0].parameters())
+    optimizer = torch.optim.AdamW(encoder_params, lr=args.lr, weight_decay=args.weight_decay)
+
     loader = DataLoader(TensorDataset(x_train, y_train), batch_size=args.batch_size, shuffle=True,
                         generator=torch.Generator().manual_seed(args.seed))
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     best_loss, stale, history = float("inf"), 0, []
-    save_json(output / "config.json", vars(args) | {"resolved_revision": revision, "labels": labels, "loss_type": "cross_entropy_plus_supcon"})
+    save_json(output / "config.json", vars(args) | {
+        "resolved_revision": revision,
+        "labels": labels,
+        "objective": "pure_era_contrastive_loss",
+        "prediction_rule": "nearest_prototype_cosine_similarity"
+    })
 
-    print(f"Training with SupCon (temperature={args.temperature}, beta={args.contrastive_weight})...")
+    print(f"Training purely with Era Contrastive (EC) Loss (temperature={args.temperature})...")
     for epoch in range(1, args.epochs + 1):
+        # --- TRAINING PHASE (Pure EC Loss) ---
         model.train()
-        total_loss, total_ce, total_con = 0.0, 0.0, 0.0
-
+        total_ec_loss = 0.0
         for x, y in loader:
             x, y = x.to(device), y.to(device)
             optimizer.zero_grad(set_to_none=True)
 
-            logits, z = model(x, return_embedding=True)
-            ce_loss = F.cross_entropy(logits, y)
-
-            if args.contrastive_weight > 0:
-                con_loss = criterion_supcon(z, y)
-                loss = ce_loss + args.contrastive_weight * con_loss
-            else:
-                con_loss = torch.tensor(0.0)
-                loss = ce_loss
+            # Extract normalized embedding z on unit hypersphere
+            z = model.encode(x)
+            loss = criterion_ec(z, y)
 
             loss.backward()
             optimizer.step()
+            total_ec_loss += loss.item() * len(y)
 
-            total_loss += loss.item() * len(y)
-            total_ce += ce_loss.item() * len(y)
-            total_con += con_loss.item() * len(y)
-
+        # --- PREDICTION & EVALUATION PHASE (Based on EC Prototypes) ---
         model.eval()
         with torch.no_grad():
-            logits = model(x_val.to(device)).cpu()
-            val_loss = F.cross_entropy(logits, y_val).item()
+            # 1. Compute class prototypes from all training embeddings
+            z_train_all = model.encode(x_train.to(device))
+            prototypes = compute_class_prototypes(z_train_all, y_train.to(device), num_classes)
+
+            # 2. Assign prototypes to model.network[3] so model(x) computes prototype similarities
+            model.set_prototypes(prototypes, temperature=args.temperature)
+
+            # 3. Predict on validation set: logits = (z_val @ prototypes.T) / tau
+            z_val = model.encode(x_val.to(device))
+            logits_val = (torch.matmul(z_val, prototypes.T) / args.temperature).cpu()
+
+            # Validation loss = negative log of prototype contrastive likelihood
+            val_loss = F.cross_entropy(logits_val, y_val).item()
 
         if not torch.isfinite(torch.tensor(val_loss)):
             raise RuntimeError("Non-finite validation loss")
 
-        scores = metrics(logits, y_val, labels)
-        n_train = len(y_train)
+        scores = metrics(logits_val, y_val, labels)
+        train_ec_avg = total_ec_loss / len(y_train)
         record = {
             "epoch": epoch,
-            "train_loss": total_loss / n_train,
-            "train_ce_loss": total_ce / n_train,
-            "train_contrastive_loss": total_con / n_train,
+            "train_ec_loss": train_ec_avg,
             "val_loss": val_loss,
             "top1": scores["top1"],
             "top3": scores["top3"],
         }
         history.append(record)
-        print(f"Epoch {epoch:03d} | Train Loss: {record['train_loss']:.4f} (CE: {record['train_ce_loss']:.4f}, Con: {record['train_contrastive_loss']:.4f}) | Val Loss: {val_loss:.4f} | Top-1: {scores['top1']*100:.2f}% | Top-3: {scores['top3']*100:.2f}%", flush=True)
+        print(f"Epoch {epoch:03d} | Train EC Loss: {train_ec_avg:.4f} | Val Contrastive Loss: {val_loss:.4f} | Top-1: {scores['top1']*100:.2f}% | Top-3: {scores['top3']*100:.2f}%", flush=True)
 
         if val_loss < best_loss:
             best_loss, stale = val_loss, 0
@@ -211,8 +244,7 @@ def main():
                 "epoch": epoch, "seed": args.seed,
                 "train_ids": [r["sample_id"] for r in train_rows],
                 "validation_ids": [r["sample_id"] for r in val_rows],
-                "training_loss": "supcon_cross_entropy",
-                "contrastive_weight": args.contrastive_weight,
+                "training_loss": "pure_era_contrastive_loss",
                 "temperature": args.temperature,
             }
             torch.save(checkpoint, output / "best.pt")
