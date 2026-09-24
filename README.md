@@ -125,15 +125,25 @@ uv run python train/train.py --task B --data-root data/raw \
   --val-manifest data/manifests/B_validation.csv --output-dir runs/B
 ```
 
-### 方式三：使用對比學習訓練（Supervised Contrastive Learning, SupCon）
+### 方式三：使用 Audio-SUC 論文方法訓練（He et al., 2024）
+```bash
+uv run python train/train_audiosuc.py --task A --output-dir runs/A_audiosuc \
+  --beta 0.5 --temperature 0.1
+
+uv run python train/train_audiosuc.py --task B --output-dir runs/B_audiosuc \
+  --beta 0.5 --temperature 0.1
+```
+*(依論文 Section 2.2，同時以分類損失 $\mathcal{L}_{MLE}$ 與 Era Contrastive 損失 $\mathcal{L}_{EC}$ 訓練投影頭，推論使用分類頭 $f(h_a)$)*
+
+### 方式四：純 EC 對比損失訓練（Pure SupCon Prototype）
 ```bash
 uv run python train/train_contrastive.py --task A --output-dir runs/A_contrastive \
-  --contrastive-weight 0.5 --temperature 0.1
+  --temperature 0.1
 
 uv run python train/train_contrastive.py --task B --output-dir runs/B_contrastive \
-  --contrastive-weight 0.5 --temperature 0.1
+  --temperature 0.1
 ```
-*(以 SupCon 損失將同一年代/類別的歌曲在超球面上拉近、不同類別推遠。儲存的 `best.pt` Checkpoint 完全相容於 `test.py` 推論)*
+*(完全不用 Cross-Entropy，以純 EC 對比損失拉近同類別並藉由類別中心原型 Prototype 進行餘弦相似度預測)*
 
 預設 AdamW、lr=0.001、weight decay=0.0001、batch size=64、最多100 epochs、patience=15、seed=42。輸出 `best.pt`、`config.json`、`history.json`、`validation_metrics.json`、`validation_confusion.png`。混淆矩陣是 counts，列為真實類別、欄為預測類別；Top-1／Top-3 是 0 到 1 的比例。固定 seed 仍可能因裝置／底層運算差異產生數值差異。
 

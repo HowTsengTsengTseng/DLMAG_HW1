@@ -1,15 +1,10 @@
-"""Fit one task-specific encoder and predict PURELY based on Era Contrastive (EC) Loss.
+"""Train Audio-SUC model using Supervised Contrastive Learning (Section 2.2, He et al., 2024).
 
-Training:
-  - Optimizes the encoder solely using Supervised Contrastive Loss (Audio-SUC EC Loss, Eq. 3 in paper).
-  - No Cross-Entropy loss is computed or backpropagated during training.
-
-Prediction:
-  - Class prototypes (mean embeddings on the unit hypersphere) are computed for each class/era.
-  - Test/Validation predictions are made purely by ranking cosine similarities between query embeddings
-    and class prototypes: score(x, c) = (z_x . w_c) / tau.
-  - The final linear layer weights are fixed to these prototypes so that checkpoints remain 100% compatible
-    with test.py inference.
+Objective:
+    L = L_MLE + beta * L_EC
+where:
+    L_MLE: Maximum Likelihood Estimation (Cross-Entropy loss) on classification head f(h_a)
+    L_EC:  Era Contrastive loss on projection head g_theta(h_a) = z (Eq. 3 in paper)
 """
 import argparse
 from pathlib import Path
@@ -26,15 +21,15 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from dataset import check_disjoint, read_manifest
 from features import extract_features
-from models import MERTEncoder, MLPClassifier
+from models import AudioSUC, MERTEncoder
 from utils import LABELS, MODEL_ID, get_device, metrics, save_confusion, save_json, seed_everything
 
 
 class EraContrastiveLoss(nn.Module):
-    """Supervised Era Contrastive (EC) Loss (Eq. 3 in He et al., 2024 / Khosla et al., 2020).
+    """Supervised Era Contrastive (EC) Loss from Eq. 3 in He et al. (2024) / Khosla et al. (2020).
 
-    Forces embeddings belonging to the same era class to be pulled together on the unit
-    hypersphere while pushing apart embeddings from different era classes.
+    Forces clusters of audio embeddings belonging to the same era class to be pulled together
+    in the embedding space, while pushing apart audio embeddings from different era classes.
     """
     def __init__(self, temperature: float = 0.1):
         super().__init__()
@@ -45,25 +40,25 @@ class EraContrastiveLoss(nn.Module):
         if batch_size <= 1:
             return torch.tensor(0.0, device=embeddings.device, requires_grad=True)
 
-        # Embeddings are on the unit hypersphere: z_i . z_j is exact cosine similarity
+        # z on unit hypersphere
         embeddings = F.normalize(embeddings, p=2, dim=-1)
         sim = torch.matmul(embeddings, embeddings.T) / self.temperature
 
-        # Subtract row-wise max for numerical stability
+        # Subtract max for numerical stability
         logits_max, _ = torch.max(sim, dim=1, keepdim=True)
         logits = sim - logits_max.detach()
 
         # Mask out self-contrast (diagonal)
         logits_mask = torch.ones_like(sim) - torch.eye(batch_size, device=embeddings.device)
 
-        # Mask for positive pairs (same label, excluding self)
+        # Mask for positive pairs (same era class, excluding self)
         label_mask = torch.eq(labels.unsqueeze(1), labels.unsqueeze(0)).float() * logits_mask
 
         # Log-probability: log [ exp(sim_ij / tau) / sum_{k != i} exp(sim_ik / tau) ]
         exp_logits = torch.exp(logits) * logits_mask
         log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True).clamp_min(1e-12))
 
-        # Mean over positive pairs for each anchor that has at least one positive
+        # Mean over positive pairs for each anchor with at least one positive
         pos_count = label_mask.sum(1)
         valid_anchors = pos_count > 0
         if not valid_anchors.any():
@@ -72,18 +67,6 @@ class EraContrastiveLoss(nn.Module):
         mean_log_prob_pos = (label_mask * log_prob).sum(1) / pos_count.clamp_min(1.0)
         loss = -mean_log_prob_pos[valid_anchors].mean()
         return loss
-
-
-@torch.no_grad()
-def compute_class_prototypes(embeddings: torch.Tensor, labels: torch.Tensor, num_classes: int) -> torch.Tensor:
-    """Compute unit-normalized mean centroid (prototype) for each class in contrastive space."""
-    prototypes = torch.zeros((num_classes, embeddings.shape[1]), device=embeddings.device)
-    for c in range(num_classes):
-        mask = (labels == c)
-        if mask.any():
-            class_mean = embeddings[mask].mean(dim=0)
-            prototypes[c] = F.normalize(class_mean, p=2, dim=-1)
-    return prototypes
 
 
 def main():
@@ -103,15 +86,18 @@ def main():
     parser.add_argument("--extract-batch-size", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--patience", type=int, default=10)
-    parser.add_argument("--hidden-dim", type=int, default=256)
+    parser.add_argument("--patience", type=int, default=15)
+    parser.add_argument("--hidden-dim", type=int, default=256, help="Dimension of audio representation h_a")
+    parser.add_argument("--proj-dim", type=int, default=128, help="Dimension of contrastive projection head z")
     parser.add_argument("--dropout", type=float, default=0.3)
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=42)
-    # EC contrastive loss temperature parameter
+    # Audio-SUC hyperparameters (beta and tau)
+    parser.add_argument("--beta", type=float, default=0.5,
+                        help="Weight beta for Era Contrastive loss L_EC in L = L_MLE + beta * L_EC (default: 0.5)")
     parser.add_argument("--temperature", "--tau", type=float, default=0.1,
-                        help="Temperature tau for EC contrastive loss (default: 0.1)")
+                        help="Temperature tau for Era Contrastive loss (default: 0.1)")
     args = parser.parse_args()
 
     if args.manifest:
@@ -127,19 +113,18 @@ def main():
         else:
             parser.error("Must provide --manifest, both --train-manifest and --val-manifest, or have data/raw/dataset_{task}/manifest.csv")
 
-    if min(args.epochs, args.patience, args.batch_size, args.hidden_dim) < 1:
-        parser.error("epochs, patience, batch-size and hidden-dim must be positive")
+    if min(args.epochs, args.patience, args.batch_size, args.hidden_dim, args.proj_dim) < 1:
+        parser.error("epochs, patience, batch-size, hidden-dim and proj-dim must be positive")
     if args.lr <= 0 or args.weight_decay < 0 or not 0 <= args.dropout < 1:
         parser.error("Invalid optimizer or dropout parameters")
-    if args.temperature <= 0:
-        parser.error("temperature must be positive")
+    if args.beta < 0 or args.temperature <= 0:
+        parser.error("beta must be non-negative and temperature must be positive")
 
     seed_everything(args.seed)
     device = get_device(args.device)
     output = Path(args.output_dir)
     output.mkdir(parents=True, exist_ok=True)
 
-    # Prevent accidental overwrite of an existing run
     if (output / "best.pt").exists():
         raise FileExistsError(f"Choose a new output directory: {output / 'best.pt'} exists")
 
@@ -162,89 +147,97 @@ def main():
     x_train, x_val = features
     y_train, y_val = [torch.tensor([labels.index(r["label"]) for r in rows]) for rows in (train_rows, val_rows)]
 
-    model_args = dict(input_dim=input_dim, hidden_dim=args.hidden_dim, num_classes=num_classes, dropout=args.dropout)
-    model = MLPClassifier(**model_args)
+    # Audio-SUC model
+    model_args = dict(
+        input_dim=input_dim,
+        hidden_dim=args.hidden_dim,
+        proj_dim=args.proj_dim,
+        num_classes=num_classes,
+        dropout=args.dropout,
+    )
+    model = AudioSUC(**model_args)
     model.fit_standardizer(x_train)
     model.to(device)
 
-    # Pure EC loss criterion
     criterion_ec = EraContrastiveLoss(temperature=args.temperature)
-
-    # Only train the encoder projection head (network[:3]). The final classifier weights (network[3])
-    # are set directly by the contrastive prototypes.
-    encoder_params = list(model.network[0].parameters())
-    optimizer = torch.optim.AdamW(encoder_params, lr=args.lr, weight_decay=args.weight_decay)
-
     loader = DataLoader(TensorDataset(x_train, y_train), batch_size=args.batch_size, shuffle=True,
                         generator=torch.Generator().manual_seed(args.seed))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     best_loss, stale, history = float("inf"), 0, []
     save_json(output / "config.json", vars(args) | {
         "resolved_revision": revision,
         "labels": labels,
-        "objective": "pure_era_contrastive_loss",
-        "prediction_rule": "nearest_prototype_cosine_similarity"
+        "model_architecture": "AudioSUC",
+        "loss_formula": "L_MLE + beta * L_EC",
     })
 
-    print(f"Training purely with Era Contrastive (EC) Loss (temperature={args.temperature})...")
+    print(f"Training Audio-SUC (beta={args.beta}, tau={args.temperature})...")
     for epoch in range(1, args.epochs + 1):
-        # --- TRAINING PHASE (Pure EC Loss) ---
         model.train()
-        total_ec_loss = 0.0
+        total_loss, total_mle, total_ec = 0.0, 0.0, 0.0
+
         for x, y in loader:
             x, y = x.to(device), y.to(device)
             optimizer.zero_grad(set_to_none=True)
 
-            # Extract normalized embedding z on unit hypersphere
-            z = model.encode(x)
-            loss = criterion_ec(z, y)
+            logits, z = model(x)  # returns logits and normalized projection z
+            loss_mle = F.cross_entropy(logits, y)
+
+            if args.beta > 0:
+                loss_ec = criterion_ec(z, y)
+                loss = loss_mle + args.beta * loss_ec
+            else:
+                loss_ec = torch.tensor(0.0)
+                loss = loss_mle
 
             loss.backward()
             optimizer.step()
-            total_ec_loss += loss.item() * len(y)
 
-        # --- PREDICTION & EVALUATION PHASE (Based on EC Prototypes) ---
+            total_loss += loss.item() * len(y)
+            total_mle += loss_mle.item() * len(y)
+            total_ec += loss_ec.item() * len(y)
+
+        # Validation phase: uses classification head f(h_a)
         model.eval()
         with torch.no_grad():
-            # 1. Compute class prototypes from all training embeddings
-            z_train_all = model.encode(x_train.to(device))
-            prototypes = compute_class_prototypes(z_train_all, y_train.to(device), num_classes)
-
-            # 2. Assign prototypes to model.network[3] so model(x) computes prototype similarities
-            model.set_prototypes(prototypes, temperature=args.temperature)
-
-            # 3. Predict on validation set: logits = (z_val @ prototypes.T) / tau
-            z_val = model.encode(x_val.to(device))
-            logits_val = (torch.matmul(z_val, prototypes.T) / args.temperature).cpu()
-
-            # Validation loss = negative log of prototype contrastive likelihood
-            val_loss = F.cross_entropy(logits_val, y_val).item()
+            logits = model(x_val.to(device)).cpu()
+            val_loss = F.cross_entropy(logits, y_val).item()
 
         if not torch.isfinite(torch.tensor(val_loss)):
             raise RuntimeError("Non-finite validation loss")
 
-        scores = metrics(logits_val, y_val, labels)
-        train_ec_avg = total_ec_loss / len(y_train)
+        scores = metrics(logits, y_val, labels)
+        n_train = len(y_train)
         record = {
             "epoch": epoch,
-            "train_ec_loss": train_ec_avg,
+            "train_loss": total_loss / n_train,
+            "train_mle_loss": total_mle / n_train,
+            "train_ec_loss": total_ec / n_train,
             "val_loss": val_loss,
             "top1": scores["top1"],
             "top3": scores["top3"],
         }
         history.append(record)
-        print(f"Epoch {epoch:03d} | Train EC Loss: {train_ec_avg:.4f} | Val Contrastive Loss: {val_loss:.4f} | Top-1: {scores['top1']*100:.2f}% | Top-3: {scores['top3']*100:.2f}%", flush=True)
+        print(f"Epoch {epoch:03d} | Train: {record['train_loss']:.4f} (MLE: {record['train_mle_loss']:.4f}, EC: {record['train_ec_loss']:.4f}) | Val Loss: {val_loss:.4f} | Top-1: {scores['top1']*100:.2f}% | Top-3: {scores['top3']*100:.2f}%", flush=True)
 
         if val_loss < best_loss:
             best_loss, stale = val_loss, 0
             checkpoint = {
-                "format_version": 1, "task": args.task, "labels": labels,
-                "model_id": args.model_id, "revision": revision, "seconds": args.seconds,
-                "model_args": model_args, "state_dict": {k: v.detach().cpu() for k, v in model.state_dict().items()},
-                "epoch": epoch, "seed": args.seed,
+                "format_version": 1,
+                "model_class": "AudioSUC",
+                "task": args.task,
+                "labels": labels,
+                "model_id": args.model_id,
+                "revision": revision,
+                "seconds": args.seconds,
+                "model_args": model_args,
+                "state_dict": {k: v.detach().cpu() for k, v in model.state_dict().items()},
+                "epoch": epoch,
+                "seed": args.seed,
                 "train_ids": [r["sample_id"] for r in train_rows],
                 "validation_ids": [r["sample_id"] for r in val_rows],
-                "training_loss": "pure_era_contrastive_loss",
+                "beta": args.beta,
                 "temperature": args.temperature,
             }
             torch.save(checkpoint, output / "best.pt")

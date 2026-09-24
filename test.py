@@ -6,7 +6,7 @@ import torch
 
 from dataset import read_manifest
 from features import extract_features
-from models import MERTEncoder, MLPClassifier
+from models import AudioSUC, MERTEncoder, MLPClassifier
 from utils import LABELS, get_device, save_json
 
 
@@ -63,7 +63,8 @@ def main():
             encoder_key = key
         x = extract_features(rows, encoder, args.cache_dir, checkpoint["model_id"],
                              checkpoint["seconds"], args.extract_batch_size)
-        model = MLPClassifier(**checkpoint["model_args"])
+        model_cls = AudioSUC if checkpoint.get("model_class") == "AudioSUC" else MLPClassifier
+        model = model_cls(**checkpoint["model_args"])
         model.load_state_dict(checkpoint["state_dict"], strict=True)
         model.to(device).eval()
         with torch.no_grad():
