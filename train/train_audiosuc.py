@@ -98,6 +98,8 @@ def main():
                         help="Weight beta for Era Contrastive loss L_EC in L = L_MLE + beta * L_EC (default: 0.5)")
     parser.add_argument("--temperature", "--tau", type=float, default=0.1,
                         help="Temperature tau for Era Contrastive loss (default: 0.1)")
+    parser.add_argument("--use-audio-cnn", action="store_true",
+                        help="Train 2D CNN directly on mel-spectrograms extracted from raw audio as in the paper (bypasses MERT)")
     args = parser.parse_args()
 
     if args.manifest:
@@ -136,32 +138,62 @@ def main():
     if {r["label"] for r in train_rows} != set(labels):
         raise ValueError("Training split must contain all six task labels")
 
-    encoder = MERTEncoder(args.model_id, args.revision).to(device)
-    revision, input_dim = encoder.revision, encoder.hidden_size
-    features = [extract_features(rows, encoder, args.cache_dir, args.model_id,
-                                 args.seconds, args.extract_batch_size) for rows in (train_rows, val_rows)]
-    del encoder
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
+    y_train = torch.tensor([labels.index(r["label"]) for r in train_rows])
+    y_val = torch.tensor([labels.index(r["label"]) for r in val_rows])
 
-    x_train, x_val = features
-    y_train, y_val = [torch.tensor([labels.index(r["label"]) for r in rows]) for rows in (train_rows, val_rows)]
+    if args.use_audio_cnn:
+        from dataset import AudioDataset
+        ds_train = AudioDataset(train_rows, sampling_rate=24000, seconds=args.seconds)
+        ds_val = AudioDataset(val_rows, sampling_rate=24000, seconds=args.seconds)
 
-    # Audio-SUC model
-    model_args = dict(
-        input_dim=input_dim,
-        hidden_dim=args.hidden_dim,
-        proj_dim=args.proj_dim,
-        num_classes=num_classes,
-        dropout=args.dropout,
-    )
-    model = AudioSUC(**model_args)
-    model.fit_standardizer(x_train)
-    model.to(device)
+        class AudioLabelDataset(torch.utils.data.Dataset):
+            def __init__(self, audio_ds, labels_tensor):
+                self.audio_ds, self.labels = audio_ds, labels_tensor
+            def __len__(self):
+                return len(self.audio_ds)
+            def __getitem__(self, idx):
+                return torch.from_numpy(self.audio_ds[idx]), self.labels[idx]
+
+        loader = DataLoader(AudioLabelDataset(ds_train, y_train), batch_size=args.batch_size, shuffle=True,
+                            generator=torch.Generator().manual_seed(args.seed))
+        val_loader = DataLoader(AudioLabelDataset(ds_val, y_val), batch_size=args.batch_size, shuffle=False)
+        model_args = dict(
+            num_classes=num_classes,
+            proj_dim=args.proj_dim,
+            sample_rate=24000,
+            n_mels=224,
+            n_fft=2048,
+            hop_length=512,
+        )
+        model = AudioSUC(**model_args).to(device)
+        revision = "audio_cnn"
+    else:
+        encoder = MERTEncoder(args.model_id, args.revision).to(device)
+        revision, input_dim = encoder.revision, encoder.hidden_size
+        features = [extract_features(rows, encoder, args.cache_dir, args.model_id,
+                                     args.seconds, args.extract_batch_size) for rows in (train_rows, val_rows)]
+        del encoder
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+        x_train, x_val = features
+        model_args = dict(
+            input_dim=input_dim,
+            hidden_dim=args.hidden_dim,
+            proj_dim=args.proj_dim,
+            num_classes=num_classes,
+            dropout=args.dropout,
+        )
+        model = AudioSUC(**model_args)
+        model.fit_standardizer(x_train)
+        model.to(device)
+
+        loader = DataLoader(TensorDataset(x_train, y_train), batch_size=args.batch_size, shuffle=True,
+                            generator=torch.Generator().manual_seed(args.seed))
+        val_loader = DataLoader(TensorDataset(x_val, y_val), batch_size=args.batch_size, shuffle=False)
 
     criterion_ec = EraContrastiveLoss(temperature=args.temperature)
-    loader = DataLoader(TensorDataset(x_train, y_train), batch_size=args.batch_size, shuffle=True,
-                        generator=torch.Generator().manual_seed(args.seed))
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     best_loss, stale, history = float("inf"), 0, []
@@ -200,9 +232,17 @@ def main():
 
         # Validation phase: uses classification head f(h_a)
         model.eval()
+        val_loss_total = 0.0
+        all_logits = []
         with torch.no_grad():
-            logits = model(x_val.to(device)).cpu()
-            val_loss = F.cross_entropy(logits, y_val).item()
+            for vx, vy in val_loader:
+                vx, vy = vx.to(device), vy.to(device)
+                vlogits = model(vx)
+                vloss = F.cross_entropy(vlogits, vy)
+                val_loss_total += vloss.item() * len(vy)
+                all_logits.append(vlogits.cpu())
+            logits = torch.cat(all_logits, dim=0)
+            val_loss = val_loss_total / len(y_val)
 
         if not torch.isfinite(torch.tensor(val_loss)):
             raise RuntimeError("Non-finite validation loss")

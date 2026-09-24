@@ -53,22 +53,34 @@ def main():
         fitted_ids = set(checkpoint["train_ids"]) | set(checkpoint["validation_ids"])
         if fitted_ids & {row["sample_id"] for row in rows}:
             raise ValueError("Test IDs overlap with training/validation IDs")
-        key = (checkpoint["model_id"], checkpoint["revision"])
-        if key != encoder_key:
-            if encoder is not None:
-                del encoder
-                if device.type == "cuda":
-                    torch.cuda.empty_cache()
-            encoder = MERTEncoder(*key).to(device)
-            encoder_key = key
-        x = extract_features(rows, encoder, args.cache_dir, checkpoint["model_id"],
-                             checkpoint["seconds"], args.extract_batch_size)
         model_cls = AudioSUC if checkpoint.get("model_class") == "AudioSUC" else MLPClassifier
         model = model_cls(**checkpoint["model_args"])
         model.load_state_dict(checkpoint["state_dict"], strict=True)
         model.to(device).eval()
-        with torch.no_grad():
-            ranks = model(x.to(device)).argsort(dim=1, descending=True)[:, :3].cpu().tolist()
+
+        if checkpoint.get("revision") == "audio_cnn":
+            from dataset import AudioDataset
+            test_ds = AudioDataset(rows, sampling_rate=24000, seconds=checkpoint["seconds"])
+            all_ranks = []
+            with torch.no_grad():
+                for idx in range(len(test_ds)):
+                    wave = torch.from_numpy(test_ds[idx]).unsqueeze(0).to(device)
+                    rank = model(wave).argsort(dim=1, descending=True)[:, :3].cpu().tolist()[0]
+                    all_ranks.append(rank)
+            ranks = all_ranks
+        else:
+            key = (checkpoint["model_id"], checkpoint["revision"])
+            if key != encoder_key:
+                if encoder is not None:
+                    del encoder
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
+                encoder = MERTEncoder(*key).to(device)
+                encoder_key = key
+            x = extract_features(rows, encoder, args.cache_dir, checkpoint["model_id"],
+                                 checkpoint["seconds"], args.extract_batch_size)
+            with torch.no_grad():
+                ranks = model(x.to(device)).argsort(dim=1, descending=True)[:, :3].cpu().tolist()
         labels = checkpoint["labels"]
         predictions[f"dataset_{task}"] = {
             row["sample_id"]: [labels[i] for i in rank] for row, rank in zip(rows, ranks)

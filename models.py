@@ -70,19 +70,16 @@ class MLPClassifier(nn.Module):
         return logits
 
 
-class AudioCNN(nn.Module):
-    """Audio-CNN baseline model from Section 2.1 (He et al., 2024).
+class AudioCNNBackbone(nn.Module):
+    """Stack of CNN layers from Section 2.1 (He et al., 2024 / Ibrahim et al., 2020).
 
-    A stack of CNN layers with BN, ELU, and average pooling:
-        H_l = ELU(BN(CNN(H_{l-1})))
-    followed by global average pooling and a linear classifier.
+    Computes: H_l = ELU(BN(CNN(H_{l-1}))) with 3x3 kernels followed by average pooling.
     """
-    def __init__(self, in_channels=1, num_classes=6, base_channels=32, num_layers=4):
+    def __init__(self, in_channels=1, channels=(32, 64, 128, 256, 256)):
         super().__init__()
         layers = []
         c_in = in_channels
-        c_out = base_channels
-        for _ in range(num_layers):
+        for c_out in channels:
             layers.extend([
                 nn.Conv2d(c_in, c_out, kernel_size=3, padding=1),
                 nn.BatchNorm2d(c_out),
@@ -90,67 +87,137 @@ class AudioCNN(nn.Module):
                 nn.AvgPool2d(kernel_size=2, stride=2),
             ])
             c_in = c_out
-            c_out = min(c_out * 2, 256)
-        self.conv_stack = nn.Sequential(*layers)
-        self.classifier = nn.Linear(c_in, num_classes)
+        self.conv = nn.Sequential(*layers)
+        self.out_dim = channels[-1]
 
-    def forward(self, mel_spec):
-        # mel_spec shape: (batch, freq, time) or (batch, 1, freq, time)
-        if mel_spec.dim() == 3:
-            mel_spec = mel_spec.unsqueeze(1)
-        feat = self.conv_stack(mel_spec)
-        h_a = feat.mean(dim=[-2, -1])  # Global average pooling
+    def forward(self, x):
+        # x: (batch, 1, n_mels, time)
+        feat = self.conv(x)
+        return feat.mean(dim=[-2, -1])  # Global average pooling -> (batch, out_dim)
+
+
+class AudioCNN(nn.Module):
+    """Audio-CNN baseline model from Section 2.1 (He et al., 2024).
+
+    Mel-spectrogram -> AudioCNNBackbone -> Classifier f(h_a).
+    Trained with cross-entropy loss L_MLE.
+    """
+    def __init__(self, num_classes=6, in_channels=1, channels=(32, 64, 128, 256, 256),
+                 sample_rate=24000, n_mels=224, n_fft=2048, hop_length=512):
+        super().__init__()
+        import torchaudio.transforms as T
+        self.mel_extractor = T.MelSpectrogram(
+            sample_rate=sample_rate, n_fft=n_fft, win_length=n_fft,
+            hop_length=hop_length, n_mels=n_mels, power=2.0
+        )
+        self.backbone = AudioCNNBackbone(in_channels=in_channels, channels=channels)
+        self.classifier = nn.Linear(self.backbone.out_dim, num_classes)
+
+    def extract_mel(self, audio):
+        # audio: (B, T)
+        mel = self.mel_extractor(audio)
+        return torch.log(mel.clamp_min(1e-6)).unsqueeze(1)
+
+    def forward(self, x):
+        if x.dim() == 2:  # raw audio waveform (B, T)
+            x = self.extract_mel(x)
+        elif x.dim() == 3:  # mel-spectrogram (B, n_mels, time)
+            x = x.unsqueeze(1)
+        h_a = self.backbone(x)
         return self.classifier(h_a)
 
 
 class AudioSUC(nn.Module):
-    """Audio-SUC: Supervised Contrastive Learning for Music Era Recognition (Section 2.2, He et al., 2024).
+    """Audio-SUC: Supervised Contrastive Learning with CNN backbone (Section 2.2, He et al., 2024).
 
-    Components:
-      1. Standardizer & representation encoder producing audio embedding h_a
-      2. Classification head f: h_a -> logits (optimized with L_MLE / Cross-Entropy)
-      3. Projection head g_theta: h_a -> z (optimized with L_EC / Era Contrastive Loss)
+    Input: Mel-spectrogram x (or raw audio waveform, or 1D feature tensor).
+    Backbone: CNN layers computing audio representation h_a.
+    Classification Head: f(h_a) -> logits (trained with L_MLE / Cross-Entropy).
+    Projection Head: g_theta(h_a) -> z on unit hypersphere (trained with L_EC / Era Contrastive Loss).
 
     Objective:
       L = L_MLE + beta * L_EC
     """
-    def __init__(self, input_dim=1024, hidden_dim=256, proj_dim=128, num_classes=6, dropout=0.3):
+    def __init__(self, num_classes=6, in_channels=1, channels=(32, 64, 128, 256, 256),
+                 proj_dim=128, sample_rate=24000, n_mels=224, n_fft=2048, hop_length=512,
+                 input_dim=None, hidden_dim=256, dropout=0.3):
         super().__init__()
-        self.register_buffer("feature_mean", torch.zeros(input_dim))
-        self.register_buffer("feature_std", torch.ones(input_dim))
+        self.input_dim = input_dim
 
-        # Representation encoder: produces audio embedding h_a
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
+        # 1D CNN adapter for pre-extracted 1D embeddings (e.g. MERT features)
+        if input_dim is not None:
+            self.register_buffer("feature_mean", torch.zeros(input_dim))
+            self.register_buffer("feature_std", torch.ones(input_dim))
+            self.backbone_1d = nn.Sequential(
+                nn.Conv1d(1, 64, kernel_size=3, padding=1),
+                nn.BatchNorm1d(64),
+                nn.ELU(),
+                nn.AvgPool1d(2),
+                nn.Conv1d(64, 128, kernel_size=3, padding=1),
+                nn.BatchNorm1d(128),
+                nn.ELU(),
+                nn.AvgPool1d(2),
+                nn.Conv1d(128, hidden_dim, kernel_size=3, padding=1),
+                nn.BatchNorm1d(hidden_dim),
+                nn.ELU(),
+                nn.AdaptiveAvgPool1d(1),
+            )
+            backbone_dim = hidden_dim
+        else:
+            backbone_dim = channels[-1]
+
+        # 2D CNN MelSpectrogram frontend (Section 3.1)
+        import torchaudio.transforms as T
+        self.mel_extractor = T.MelSpectrogram(
+            sample_rate=sample_rate, n_fft=n_fft, win_length=n_fft,
+            hop_length=hop_length, n_mels=n_mels, power=2.0
         )
+        self.backbone_2d = AudioCNNBackbone(in_channels=in_channels, channels=channels)
 
         # Classification head f(h_a) -> logits
-        self.classifier = nn.Linear(hidden_dim, num_classes)
+        self.classifier = nn.Linear(backbone_dim, num_classes)
 
         # Projection head g_theta(h_a) -> z on unit hypersphere
         self.projection_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, proj_dim),
+            nn.Linear(backbone_dim, backbone_dim),
+            nn.ELU(),
+            nn.Linear(backbone_dim, proj_dim),
         )
 
     @torch.no_grad()
     def fit_standardizer(self, training_features):
-        self.feature_mean.copy_(training_features.mean(0))
-        self.feature_std.copy_(training_features.std(0, unbiased=False).clamp_min(1e-6))
+        if hasattr(self, "feature_mean"):
+            self.feature_mean.copy_(training_features.mean(0))
+            self.feature_std.copy_(training_features.std(0, unbiased=False).clamp_min(1e-6))
 
-    def encode(self, features):
-        """Compute audio embedding h_a and contrastive projection z."""
-        standardized = (features - self.feature_mean) / self.feature_std
-        normed = F.normalize(standardized, p=2, dim=-1)
-        h_a = self.encoder(normed)
+    def extract_mel(self, audio):
+        # audio: (B, T)
+        mel = self.mel_extractor(audio)
+        return torch.log(mel.clamp_min(1e-6)).unsqueeze(1)  # (B, 1, n_mels, time)
+
+    def encode(self, x):
+        """Extract audio embedding h_a and normalized contrastive projection z."""
+        if x.dim() == 2 and hasattr(self, "feature_mean") and x.shape[1] == self.input_dim:
+            # 1D feature tensor (e.g. MERT features) -> 1D CNN
+            standardized = (x - self.feature_mean) / self.feature_std
+            normed = F.normalize(standardized, p=2, dim=-1).unsqueeze(1)  # (B, 1, D)
+            h_a = self.backbone_1d(normed).squeeze(-1)  # (B, hidden_dim)
+        elif x.dim() == 2:
+            # Raw audio waveform (B, T) -> Mel-spectrogram -> 2D CNN
+            mel = self.extract_mel(x)
+            h_a = self.backbone_2d(mel)
+        elif x.dim() == 3:
+            # (B, n_mels, time) -> 2D CNN
+            h_a = self.backbone_2d(x.unsqueeze(1))
+        else:
+            # (B, 1, n_mels, time) -> 2D CNN
+            h_a = self.backbone_2d(x)
+
         z = F.normalize(self.projection_head(h_a), p=2, dim=-1)
         return h_a, z
 
-    def forward(self, features, return_projection=False):
-        h_a, z = self.encode(features)
+    def forward(self, x, return_projection=False):
+        h_a, z = self.encode(x)
         logits = self.classifier(h_a)
         if return_projection or self.training:
             return logits, z
