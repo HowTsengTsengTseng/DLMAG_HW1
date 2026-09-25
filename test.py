@@ -6,7 +6,7 @@ import torch
 
 from dataset import read_manifest
 from features import extract_features
-from models import AudioSUC, MERTEncoder, MLPClassifier
+from models import AudioSUC, MERTEncoder, MLPClassifier, SVMClassifier
 from utils import LABELS, get_device, save_json
 
 
@@ -53,7 +53,13 @@ def main():
         fitted_ids = set(checkpoint["train_ids"]) | set(checkpoint["validation_ids"])
         if fitted_ids & {row["sample_id"] for row in rows}:
             raise ValueError("Test IDs overlap with training/validation IDs")
-        model_cls = AudioSUC if checkpoint.get("model_class") == "AudioSUC" else MLPClassifier
+        model_name = checkpoint.get("model_class", "MLPClassifier")
+        if model_name == "AudioSUC":
+            model_cls = AudioSUC
+        elif model_name == "SVMClassifier":
+            model_cls = SVMClassifier
+        else:
+            model_cls = MLPClassifier
         model = model_cls(**checkpoint["model_args"])
         model.load_state_dict(checkpoint["state_dict"], strict=True)
         model.to(device).eval()

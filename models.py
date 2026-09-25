@@ -70,6 +70,42 @@ class MLPClassifier(nn.Module):
         return logits
 
 
+class SVMClassifier(nn.Module):
+    """Linear Support Vector Machine classifier with integrated feature standardizer.
+
+    Standardizes features, L2-normalizes, and computes the linear SVM decision margin:
+        decision_scores = linear(normalize((x - mean) / std))
+    Fitted via scikit-learn (LinearSVC/SVC) and stored as PyTorch parameters for seamless
+    GPU/CPU inference in test.py without scikit-learn dependencies.
+    """
+    def __init__(self, input_dim=1024, num_classes=6):
+        super().__init__()
+        self.register_buffer("feature_mean", torch.zeros(input_dim))
+        self.register_buffer("feature_std", torch.ones(input_dim))
+        self.linear = nn.Linear(input_dim, num_classes)
+
+    @torch.no_grad()
+    def fit_standardizer(self, training_features):
+        self.feature_mean.copy_(training_features.mean(0))
+        self.feature_std.copy_(training_features.std(0, unbiased=False).clamp_min(1e-6))
+
+    @torch.no_grad()
+    def set_weights(self, coef, intercept):
+        """Set linear weights and bias from fitted sklearn model."""
+        import numpy as np
+        if isinstance(coef, np.ndarray):
+            coef = torch.from_numpy(coef)
+        if isinstance(intercept, np.ndarray):
+            intercept = torch.from_numpy(intercept)
+        self.linear.weight.copy_(coef.float())
+        self.linear.bias.copy_(intercept.float())
+
+    def forward(self, features):
+        standardized = (features - self.feature_mean) / self.feature_std
+        normed = F.normalize(standardized, p=2, dim=-1)
+        return self.linear(normed)
+
+
 class AudioCNNBackbone(nn.Module):
     """Stack of CNN layers from Section 2.1 (He et al., 2024 / Ibrahim et al., 2020).
 
