@@ -16,6 +16,9 @@ dependencies = [
   "gdown==5.2.0",
   "python-dotenv>=1,<2",
   "tqdm>=4.67,<5",
+  "julius==0.2.8",
+  "torch-pitch-shift==1.2.5",
+  "torchaudio-augmentations==0.2.4",
 ]
 [dependency-groups]
 notebooks = ["jupyterlab>=4,<5", "ipykernel>=6,<7"]

@@ -86,8 +86,8 @@ def check_disjoint(*splits):
 
 
 class AudioDataset(Dataset):
-    def __init__(self, rows, sampling_rate=24000, seconds=30.0):
-        self.rows, self.sampling_rate, self.seconds = rows, sampling_rate, seconds
+    def __init__(self, rows, sampling_rate=24000, seconds=30.0, transform=None):
+        self.rows, self.sampling_rate, self.seconds, self.transform = rows, sampling_rate, seconds, transform
 
     def __len__(self):
         return len(self.rows)
@@ -105,6 +105,10 @@ class AudioDataset(Dataset):
             wave = AF.resample(wave, sr, self.sampling_rate)
         if len(wave) < 1025:
             raise ValueError(f"Audio shorter than MERT-v2 minimum 1025 samples: {row['path']}")
+
+        if self.transform:
+            wave = self.transform(wave)
+
         return wave.numpy()
 
 

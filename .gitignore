@@ -3,6 +3,7 @@
 .cache/
 data/
 runs/
+tests/
 predictions/
 __pycache__/
 *.pyc

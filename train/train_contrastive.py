@@ -60,7 +60,7 @@ def main():
     parser.add_argument("--extract-batch-size", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--patience", type=int, default=10)
+    parser.add_argument("--patience", type=int, default=15)
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--dropout", type=float, default=0.3)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -69,6 +69,8 @@ def main():
     # EC contrastive loss temperature parameter
     parser.add_argument("--temperature", "--tau", type=float, default=0.1,
                         help="Temperature tau for EC contrastive loss (default: 0.1)")
+    parser.add_argument("--with-augmentation", action="store_true",
+                        help="Use augmentation for training")
     args = parser.parse_args()
 
     if args.manifest:
@@ -110,13 +112,17 @@ def main():
 
     encoder = MERTEncoder(args.model_id, args.revision).to(device)
     revision, input_dim = encoder.revision, encoder.hidden_size
-    features = [extract_features(rows, encoder, args.cache_dir, args.model_id,
-                                 args.seconds, args.extract_batch_size) for rows in (train_rows, val_rows)]
+    x_train = extract_features(train_rows, encoder, args.cache_dir, args.model_id,
+                               args.seconds, args.extract_batch_size, args.with_augmentation)
+    x_val = extract_features(val_rows, encoder, args.cache_dir, args.model_id,
+                             args.seconds, args.extract_batch_size)
+    # features = [extract_features(rows, encoder, args.cache_dir, args.model_id,
+                                 # args.seconds, args.extract_batch_size, args.with_augmentation) for rows in (train_rows, val_rows)]
     del encoder
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    x_train, x_val = features
+    # x_train, x_val = features
     y_train, y_val = [torch.tensor([labels.index(r["label"]) for r in rows]) for rows in (train_rows, val_rows)]
 
     model_args = dict(input_dim=input_dim, hidden_dim=args.hidden_dim, num_classes=num_classes, dropout=args.dropout)

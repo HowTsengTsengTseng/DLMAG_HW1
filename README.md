@@ -5,10 +5,12 @@
 ## 目錄
 
 ```text
-models.py                 MERT encoder、標準化與 MLP
+models.py                 MERT encoder、標準化、MLP、SVM 與 Audio-SUC
 train/                    訓練腳本目錄
   train.py                標準 Cross-Entropy 訓練
+  train_svm.py            MERT + SVM（支援自動 C 網格搜索與 PyTorch Checkpoint）
   train_contrastive.py    Supervised Contrastive (SupCon) + CE 訓練
+  train_audiosuc.py       Audio-SUC 論文 CNN / Contrastive 訓練
 train.py                  根目錄捷徑訓練腳本
 test.py                   兩個任務的 test 推論與作業 JSON（不是單元測試）
 dataset.py                gdown 下載、安全解壓縮、manifest 轉換與音訊讀取
@@ -45,6 +47,115 @@ cd /Users/cengchenghao/Documents/Codex/2026-09-19/files-mentioned-by-the-user-ho
 ```bash
 uv export --frozen --no-dev --no-hashes --no-emit-project --output-file requirements.txt
 ```
+
+### 工作站沒有 sudo：修補 site-packages 的 SoX import
+
+Linux 工作站若沒有 `libsox.so`，直接 import PyPI 版 `torchaudio-augmentations` 可能在載入 `augment` 時失敗。以下是暫時性 workaround：直接修改目前 `.venv` 內的套件原始碼。這些修改不在 Git 中，之後執行 `uv sync` 可能被覆蓋；若要永久重現，應改用專案內的本地 augmentation source 或安裝系統／個人目錄的 SoX。
+
+先確認套件位置：
+
+```bash
+uv run python - <<'PY'
+import torchaudio_augmentations
+print(torchaudio_augmentations.__path__[0])
+PY
+```
+
+通常會是 `.venv/lib/python3.11/site-packages/torchaudio_augmentations`。設定路徑後編輯：
+
+```bash
+TA_PATH="$PWD/.venv/lib/python3.11/site-packages/torchaudio_augmentations"
+nano "$TA_PATH/augmentations/pitch_shift.py"
+```
+
+將 `pitch_shift.py` 改成使用 `torch-pitch-shift`，移除 `import augment`：
+
+```python
+import random
+
+import torch
+from torch_pitch_shift import get_fast_shifts, pitch_shift, semitones_to_ratio
+
+
+class PitchShift:
+    def __init__(self, n_samples, sample_rate, pitch_shift_min=-7.0, pitch_shift_max=7.0):
+        self.n_samples = n_samples
+        self.sample_rate = sample_rate
+        self.fast_shifts = get_fast_shifts(
+            sample_rate,
+            lambda ratio: (
+                semitones_to_ratio(pitch_shift_min)
+                <= ratio <= semitones_to_ratio(pitch_shift_max)
+                and ratio != 1
+            ),
+        )
+
+    def process(self, audio):
+        output = pitch_shift(
+            input=audio.unsqueeze(0),
+            shift=random.choice(self.fast_shifts),
+            sample_rate=self.sample_rate,
+            bins_per_octave=12,
+        ).squeeze(0)
+        if not torch.isfinite(output).all():
+            return audio.clone()
+        target_length = audio.shape[-1]
+        if output.shape[-1] > target_length:
+            return output[..., :target_length]
+        if output.shape[-1] < target_length:
+            padded = torch.zeros_like(audio)
+            padded[..., :output.shape[-1]] = output
+            return padded
+        return output
+
+    def __call__(self, audio):
+        if audio.ndim == 3:
+            return torch.stack([self.process(sample) for sample in audio], dim=0)
+        return self.process(audio)
+```
+
+再編輯 Reverb：
+
+```bash
+nano "$TA_PATH/augmentations/reverb.py"
+```
+
+將檔案開頭的 `import augment` 改成：
+
+```python
+import torch
+
+try:
+    import augment
+except (ImportError, OSError):
+    augment = None
+```
+
+並在 `forward` 的第一行加入：
+
+```python
+def forward(self, audio):
+    if augment is None:
+        return audio.clone()
+```
+
+沒有 SoX 時，Reverb 會退回原始音訊，但不會阻止其他 augmentation 執行。確認 Python 載入的是修改後的檔案：
+
+```bash
+uv run python - <<'PY'
+import inspect
+from torchaudio_augmentations import PitchShift
+print(inspect.getfile(PitchShift))
+PY
+```
+
+最後執行 augmentation unittest：
+
+```bash
+uv run python -m unittest tests.test_augmentation -v
+```
+
+若之後重新執行 `uv sync`，請重新套用以上修改；`uv sync` 不會保留直接編輯 `site-packages` 的內容。
 
 預設 `--device auto` 選 CUDA，沒有 CUDA 時使用 CPU。macOS 使用 CPU；沒有預設啟用 MPS。MERT 約 632M 參數，特徵擷取比 MLP 訓練耗費資源，預設 extraction batch size 為 1。顯存需求未實測；若 CUDA 記憶體不足，使用 CPU 或先減少音訊長度。改變長度需重新訓練以保持前處理一致。
 
@@ -144,6 +255,17 @@ uv run python train/train_contrastive.py --task B --output-dir runs/B_contrastiv
   --temperature 0.1
 ```
 *(完全不用 Cross-Entropy，以純 EC 對比損失拉近同類別並藉由類別中心原型 Prototype 進行餘弦相似度預測)*
+
+### 方式五：MERT + SVM（支援自動 C 網格搜索與最大邊界分類）
+```bash
+# 自動搜索最佳 C 值 (0.001 ~ 100.0)
+uv run python train/train_svm.py --task A --output-dir runs/A_svm --kernel linear
+uv run python train/train_svm.py --task B --output-dir runs/B_svm --kernel linear
+
+# 或指定特定 C 值
+uv run python train/train_svm.py --task A --output-dir runs/A_svm_c1 --kernel linear --c 1.0
+```
+*(在單位超球面 MERT 特徵上訓練 SVM 最大邊界分類器，自動挑選最佳 C，並將權重轉換為 PyTorch `best.pt`，與 `test.py` 100% 相容)*
 
 預設 AdamW、lr=0.001、weight decay=0.0001、batch size=64、最多100 epochs、patience=15、seed=42。輸出 `best.pt`、`config.json`、`history.json`、`validation_metrics.json`、`validation_confusion.png`。混淆矩陣是 counts，列為真實類別、欄為預測類別；Top-1／Top-3 是 0 到 1 的比例。固定 seed 仍可能因裝置／底層運算差異產生數值差異。
 
