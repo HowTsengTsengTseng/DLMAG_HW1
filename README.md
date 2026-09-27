@@ -273,6 +273,54 @@ uv run python train/train_svm.py --task A --output-dir runs/A_svm_c1 --kernel li
 
 ## 未來執行推論與提交
 
+### LoRA + standard SupCon pipeline
+
+The original frozen-feature MLP commands above remain supported. The following
+new entry point trains task-specific LoRA adapters on MERT-v2-30s. It verifies
+the actual remote model's attention module paths at runtime and records the
+resolved model revision and package versions in each output directory. PEFT is
+required (`uv sync` or `pip install -r requirements.txt`).
+
+Stage 1 uses two independently sampled 10-second views from two recordings per
+class and standard supervised contrastive loss. Checkpoints are written at
+epochs 5, 10, and 20 (or the configured maximum):
+
+```bash
+uv run python train/train_lora.py stage1 --task A --output-dir runs/A_lora_s1
+uv run python train/train_lora.py stage1 --task B --output-dir runs/B_lora_s1
+```
+
+Run the linear probe separately for each Stage 1 candidate. It extracts fixed
+0–10, 10–20, and 20–30 second crops, fits standardization on training crops,
+and selects by recording-level validation Top-1:
+
+```bash
+uv run python train/train_lora.py probe --task A --stage1 runs/A_lora_s1/epoch_010.pt --output-dir runs/A_lora_probe
+uv run python train/train_lora.py probe --task B --stage1 runs/B_lora_s1/epoch_010.pt --output-dir runs/B_lora_probe
+```
+
+The joint LoRA + CE baseline uses the same verified adapter placement and
+class-balanced two-view batches. Its direct pooled representation intentionally
+does not use the Stage 2 standardizer:
+
+```bash
+uv run python train/train_lora.py ce --task A --output-dir runs/A_lora_ce
+uv run python train/train_lora.py ce --task B --output-dir runs/B_lora_ce
+```
+
+Generate assignment-compatible predictions with the shared three-crop
+probability-averaging path:
+
+```bash
+uv run python infer_lora.py --checkpoint-a runs/A_lora_probe/best.pt \
+  --checkpoint-b runs/B_lora_probe/best.pt --output predictions/lora.json
+```
+
+The implementation intentionally does not merge adapters. A checkpoint stores
+the pinned base model ID/revision, adapter weights, external classifier,
+standardization statistics when applicable, label order, crop/pooling policy,
+and validation metadata.
+
 ```bash
 uv run python test.py --data-root /path/on/grader/device \
   --manifest-a data/manifests/A_test.csv \
