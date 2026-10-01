@@ -44,3 +44,19 @@ class EraContrastiveLoss(nn.Module):
         mean_log_prob_pos = (label_mask * log_prob).sum(1) / pos_count.clamp_min(1.0)
         loss = -mean_log_prob_pos[valid_anchors].mean()
         return loss
+
+
+def supcon_loss(z, labels, temperature=.1):
+    """Standard SupCon with all non-self views in the denominator."""
+    z = F.normalize(z.float(), dim=-1)
+    logits = z @ z.T / temperature
+    n = logits.shape[0]
+    self_mask = torch.eye(n, device=z.device, dtype=torch.bool)
+    positive = labels[:, None].eq(labels[None, :]) & ~self_mask
+    logits = logits.masked_fill(self_mask, float("-inf"))
+    log_prob = logits - torch.logsumexp(logits, dim=1, keepdim=True)
+    count = positive.sum(1)
+    valid = count > 0
+    if not valid.any():
+        raise ValueError("SupCon batch contains no positive pair")
+    return -(log_prob.masked_fill(~positive, 0).sum(1)[valid] / count[valid]).mean()

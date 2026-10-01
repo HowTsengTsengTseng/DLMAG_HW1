@@ -47,6 +47,15 @@ def metrics(logits, targets, labels):
     }
 
 
+def combine_and_record_scores(logits, labels, n_records):
+    probs = logits.softmax(-1).reshape(n_records, 3, -1).mean(1)
+    y = labels[::3][:n_records]
+    top1 = (probs.argmax(1) == y).float().mean().item()
+    top3 = (probs.topk(3, 1).indices == y[:, None]).any(1).float().mean().item()
+    ce = (-probs[torch.arange(n_records), y].clamp_min(1e-8).log()).mean().item()
+    return probs, {"top1": top1, "top3": top3, "loss": ce}
+
+
 def save_confusion(result, path):
     import matplotlib
     matplotlib.use("Agg")

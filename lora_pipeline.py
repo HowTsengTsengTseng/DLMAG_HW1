@@ -120,26 +120,6 @@ def trainable_report(model: nn.Module):
             "names": [n for n, _ in rows]}
 
 
-class ProjectionHead(nn.Module):
-    def __init__(self, dim=1024):
-        super().__init__()
-        self.net = nn.Sequential(nn.Linear(dim, 256), nn.GELU(), nn.Linear(256, 128))
-
-    def forward(self, h):
-        return F.normalize(self.net(h.float()), dim=-1)
-
-
-class LinearClassifier(nn.Module):
-    def __init__(self, dim=1024, classes=6):
-        super().__init__()
-        # self.linear = nn.Linear(dim, classes)
-        self.net = nn.Sequential(nn.Linear(dim, 256), nn.Linear(256, classes))
-
-    def forward(self, x):
-        # return self.linear(x)
-        return self.net(x)
-
-
 def masked_pool(output):
     hidden = output.last_hidden_state
     mask = getattr(output, "feature_attention_mask", None)
@@ -160,60 +140,6 @@ def forward_h(encoder, waveforms):
         inputs["attention_mask"] = inputs["attention_mask"].t().expand(-1, inputs["input_values"].shape[1])
     inputs = inputs.to(next(encoder.backbone.parameters()).device)
     return masked_pool(encoder.backbone(**inputs, return_dict=True))
-
-
-def supcon_loss(z, labels, temperature=.1):
-    """Standard SupCon with all non-self views in the denominator."""
-    z = F.normalize(z.float(), dim=-1)
-    logits = z @ z.T / temperature
-    n = logits.shape[0]
-    self_mask = torch.eye(n, device=z.device, dtype=torch.bool)
-    positive = labels[:, None].eq(labels[None, :]) & ~self_mask
-    logits = logits.masked_fill(self_mask, float("-inf"))
-    log_prob = logits - torch.logsumexp(logits, dim=1, keepdim=True)
-    count = positive.sum(1)
-    valid = count > 0
-    if not valid.any():
-        raise ValueError("SupCon batch contains no positive pair")
-    return -(log_prob.masked_fill(~positive, 0).sum(1)[valid] / count[valid]).mean()
-
-
-class TwoViewDataset(Dataset):
-    def __init__(self, rows, sample_rate=24000, crop_seconds=10):
-        self.rows, self.crop_samples = rows, round(sample_rate * crop_seconds)
-        self.base = AudioDataset(rows, sample_rate, seconds=30)
-
-    def __len__(self): return len(self.rows)
-
-    def __getitem__(self, index):
-        wave = torch.from_numpy(self.base[index])
-        views = []
-        for _ in range(2):
-            if len(wave) > self.crop_samples:
-                start = random.randint(0, len(wave) - self.crop_samples)
-                views.append(wave[start:start + self.crop_samples].numpy())
-            else:
-                views.append(F.pad(wave, (0, self.crop_samples - len(wave))).numpy())
-        return views[0], views[1], int(self.rows[index]["label_index"])
-
-
-class ClassBalancedBatchSampler:
-    def __init__(self, rows, classes=6, recordings_per_class=2, batches=0):
-        self.by_class = {c: [i for i, r in enumerate(rows) if r["label_index"] == c]
-                         for c in range(classes)}
-        self.classes, self.rpc = classes, recordings_per_class
-        self.batches = batches or max(1, len(rows) // (classes * recordings_per_class))
-
-    def __iter__(self):
-        for _ in range(self.batches):
-            chosen = []
-            for c in random.sample(range(self.classes), self.classes):
-                pool = self.by_class[c]
-                chosen.extend(random.choices(pool, k=self.rpc) if len(pool) < self.rpc
-                               else random.sample(pool, self.rpc))
-            yield chosen
-
-    def __len__(self): return self.batches
 
 
 def fixed_crops(rows, sample_rate=24000, crop_seconds=10):

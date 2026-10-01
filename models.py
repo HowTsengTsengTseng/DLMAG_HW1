@@ -311,3 +311,30 @@ class CNNv2(nn.Module):
         x = self.drop4(x)
         x = self.fc2(x)
         return F.softmax(x, dim=1)
+
+
+class ProjectionHead(nn.Module):
+    def __init__(self, dim=1024):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(dim, 256), nn.GELU(), nn.Linear(256, 128))
+
+    def forward(self, h):
+        return F.normalize(self.net(h.float()), dim=-1)
+
+
+class LinearClassifier(nn.Module):
+    def __init__(self, dim=1024, classes=6):
+        super().__init__()
+        self.linear = nn.Linear(dim, classes)
+
+    def forward(self, x):
+        return self.linear(x)
+
+
+class NonLinearClassifier(nn.Module):
+    def __init__(self, dim=1024, classes=6):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(dim, 512), nn.GELU(), nn.Linear(512, classes))
+
+    def forward(self, x):
+        return self.net(x)

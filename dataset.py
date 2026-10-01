@@ -112,6 +112,57 @@ class AudioDataset(Dataset):
         return wave.numpy()
 
 
+class LabeledAudioDataset(Dataset):
+    """Pair lazily loaded waveforms with their encoded era labels."""
+    def __init__(self, audio_dataset, labels):
+        self.audio_dataset = audio_dataset
+        self.labels = labels
+
+    def __len__(self):
+        return len(self.audio_dataset)
+
+    def __getitem__(self, index):
+        return torch.as_tensor(self.audio_dataset[index], dtype=torch.float32), self.labels[index]
+
+
+class TwoViewDataset(Dataset):
+    def __init__(self, rows, sample_rate=24000, crop_seconds=10):
+        self.rows, self.crop_samples = rows, round(sample_rate * crop_seconds)
+        self.base = AudioDataset(rows, sample_rate, seconds=30)
+
+    def __len__(self): return len(self.rows)
+
+    def __getitem__(self, index):
+        wave = torch.from_numpy(self.base[index])
+        views = []
+        for _ in range(2):
+            if len(wave) > self.crop_samples:
+                start = random.randint(0, len(wave) - self.crop_samples)
+                views.append(wave[start:start + self.crop_samples].numpy())
+            else:
+                views.append(F.pad(wave, (0, self.crop_samples - len(wave))).numpy())
+        return views[0], views[1], int(self.rows[index]["label_index"])
+
+
+class ClassBalancedBatchSampler:
+    def __init__(self, rows, classes=6, recordings_per_class=2, batches=0):
+        self.by_class = {c: [i for i, r in enumerate(rows) if r["label_index"] == c]
+                         for c in range(classes)}
+        self.classes, self.rpc = classes, recordings_per_class
+        self.batches = batches or max(1, len(rows) // (classes * recordings_per_class))
+
+    def __iter__(self):
+        for _ in range(self.batches):
+            chosen = []
+            for c in random.sample(range(self.classes), self.classes):
+                pool = self.by_class[c]
+                chosen.extend(random.choices(pool, k=self.rpc) if len(pool) < self.rpc
+                               else random.sample(pool, self.rpc))
+            yield chosen
+
+    def __len__(self): return self.batches
+
+
 def download_dataset(output):
     import gdown
     output = Path(output)

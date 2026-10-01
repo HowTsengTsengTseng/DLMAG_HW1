@@ -16,17 +16,17 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader, TensorDataset
 from dotenv import load_dotenv
 
-from dataset import check_disjoint, read_manifest
-from lora_pipeline import (ClassBalancedBatchSampler, LinearClassifier, ProjectionHead,
-    TwoViewDataset, fixed_crops, forward_h, make_lora_encoder, package_versions,
-    save_json, supcon_loss, trainable_report)
-from utils import LABELS, MODEL_ID, get_device, metrics, save_confusion, seed_everything, compute_svm_metrics
+from dataset import check_disjoint, read_manifest, TwoViewDataset, ClassBalancedBatchSampler
+from lora_pipeline import (fixed_crops, forward_h, make_lora_encoder, package_versions,
+    save_json, trainable_report)
+from utils import LABELS, MODEL_ID, get_device, metrics, save_confusion, seed_everything, compute_svm_metrics, combine_and_record_scores
 from features import extract_features
 from peft import TaskType, PeftType
 
 from sklearn.svm import LinearSVC
 import numpy as np
-from models import SVMClassifier
+from models import SVMClassifier, ProjectionHead, LinearClassifier, NonLinearClassifier
+from loss import supcon_loss
 
 torch.serialization.add_safe_globals([TaskType, PeftType])
 
@@ -122,17 +122,19 @@ def pooled_crops(encoder, waves, device, batch_size=16):
     return torch.cat(result)
 
 
-def recording_scores(logits, labels, n_records):
-    probs = logits.softmax(-1).reshape(n_records, 3, -1).mean(1)
-    y = labels[::3][:n_records]
-    top1 = (probs.argmax(1) == y).float().mean().item()
-    top3 = (probs.topk(3, 1).indices == y[:, None]).any(1).float().mean().item()
-    ce = (-probs[torch.arange(n_records), y].clamp_min(1e-8).log()).mean().item()
-    return probs, {"top1": top1, "top3": top3, "loss": ce}
+def get_classifier(classifier):
+    if classifier == "linear":
+        return LinearClassifier
+    elif classifier == "nonlinear":
+        return NonLinearClassifier
+    else:
+        raise ValueError(f"Unknown classifier: {classifier}")
+
 
 best = (-1, float("inf"))
 
 def probe(args, ckpt_path):
+    CLF = get_classifier(args.classifier)
     seed_everything(args.seed); device = get_device(args.device)
     train, val, _ = rows_for(args); ckpt, encoder, report = load_stage1(ckpt_path, device)
     xtr = fixed_crops(train, encoder.processor.sampling_rate, args.crop_seconds)
@@ -142,7 +144,7 @@ def probe(args, ckpt_path):
     htr, hva = (htr - mean) / std, (hva - mean) / std
     ytr = torch.tensor([r["label_index"] for r in train]).repeat_interleave(3)
     yva = torch.tensor([r["label_index"] for r in val]).repeat_interleave(3)
-    model = LinearClassifier(htr.shape[1], 6); opt = torch.optim.AdamW(model.parameters(), lr=args.classifier_lr, weight_decay=args.classifier_weight_decay)
+    model = CLF(htr.shape[1], 6); opt = torch.optim.AdamW(model.parameters(), lr=args.classifier_lr, weight_decay=args.classifier_weight_decay)
     loader = DataLoader(TensorDataset(htr, ytr), batch_size=args.classifier_batch_size, shuffle=True)
     global best; stale = 0; out = Path(args.output_dir); out.mkdir(parents=True, exist_ok=True)
     for epoch in range(1, args.classifier_epochs + 1):
@@ -151,7 +153,7 @@ def probe(args, ckpt_path):
             opt.zero_grad(); F.cross_entropy(model(x), y).backward(); opt.step()
         model.eval();
         logits = model(hva);
-        probs, score = recording_scores(logits, yva, len(val));
+        probs, score = combine_and_record_scores(logits, yva, len(val));
         print(f"epoch={epoch} {score}")
         key = (score["top1"], -score["loss"])
         if key > (best[0], -best[1]):
@@ -276,9 +278,10 @@ def probe_with_svm(args):
 
 
 def ce_baseline(args):
+    CLF = get_classifier(args.classifier)
     seed_everything(args.seed); device = get_device(args.device); train, val, _ = rows_for(args)
     encoder, report = make_lora_encoder(args.model_id, args.revision, device, args.lora)
-    model = LinearClassifier(encoder.hidden_size, 6).to(device)
+    model = CLF(encoder.hidden_size, 6).to(device)
     ds = TwoViewDataset(train, encoder.processor.sampling_rate, args.crop_seconds)
     sampler = ClassBalancedBatchSampler(train, args.classes_per_batch, args.recordings_per_class, args.batches_per_epoch)
     loader = DataLoader(ds, batch_sampler=sampler)
@@ -297,7 +300,7 @@ def ce_baseline(args):
             opt.zero_grad(set_to_none=True); h = forward_h(encoder, waves); loss = F.cross_entropy(model(h), yy); loss.backward(); torch.nn.utils.clip_grad_norm_(list(encoder.parameters()) + list(model.parameters()), 1); opt.step()
         # Validation uses the shared fixed-crop recording-level inference rule.
         x = fixed_crops(val, encoder.processor.sampling_rate, args.crop_seconds); h = pooled_crops(encoder, x, device, args.extract_batch_size).to(device)
-        y = torch.tensor([r["label_index"] for r in val]).repeat_interleave(3); model.eval(); probs, score = recording_scores(model(h).cpu(), y, len(val)); print(f"epoch={epoch} {score}")
+        y = torch.tensor([r["label_index"] for r in val]).repeat_interleave(3); model.eval(); probs, score = combine_and_record_scores(model(h).cpu(), y, len(val)); print(f"epoch={epoch} {score}")
         if score["top1"] > best:
             best = score["top1"]
             from peft import get_peft_model_state_dict
@@ -332,6 +335,7 @@ def main():
     p.add_argument("--lora", type=json.loads, default={"r":8,"alpha":16,"dropout":.05})
     p.add_argument("--stage1");
     p.add_argument("--std-floor", type=float, default=1e-6);
+    p.add_argument("--classifier", type=str, default="linear", choices=["linear", "svm", "nonlinear"]);
     p.add_argument("--classifier-lr", type=float, default=1e-5);
     p.add_argument("--classifier-weight-decay", type=float, default=1e-4);
     p.add_argument("--classifier-batch-size", type=int, default=64);
@@ -339,17 +343,18 @@ def main():
     p.add_argument("--classifier-patience", type=int, default=15);
     p.add_argument("--ce-epochs", type=int, default=50);
     p.add_argument("--ce-warmup", type=int, default=4)
-    p.add_argument("--svm", action="store_true")
     p.add_argument("--probe-all", action="store_true")
     p.add_argument("--cache-dir", default="data/features")
     args = p.parse_args(); load_dotenv()
     if args.mode == "stage1": stage1(args)
     elif args.mode == "probe":
         if not args.stage1: p.error("probe requires --stage1")
-        if args.svm:
+
+        if args.classifier == "svm":
             probe_with_svm(args)
-        elif args.probe_all:
-            probe_all_checkpoints(args)
+
+        if args.probe_all:
+            probe_all_checkpoints(args, args.stage1)
         else:
             probe(args, args.stage1)
     else: ce_baseline(args)
