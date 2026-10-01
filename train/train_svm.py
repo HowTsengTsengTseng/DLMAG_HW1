@@ -16,24 +16,7 @@ from torch.nn import functional as F
 from dataset import check_disjoint, read_manifest
 from features import extract_features
 from models import MERTEncoder, SVMClassifier
-from utils import LABELS, MODEL_ID, get_device, save_confusion, save_json, seed_everything
-
-
-def compute_svm_metrics(decision_scores, targets, labels):
-    """Compute Top-1 and Top-3 accuracy from SVM decision function scores."""
-    # decision_scores: (N, num_classes)
-    ranks = np.argsort(-decision_scores, axis=1)
-    top1 = (ranks[:, 0] == targets).mean()
-    top3 = np.array([targets[i] in ranks[i, :3] for i in range(len(targets))]).mean()
-    cm = confusion_matrix(targets, ranks[:, 0], labels=list(range(len(labels)))).tolist()
-    return {
-        "n_samples": len(targets),
-        "top1": float(top1),
-        "top3": float(top3),
-        "labels": labels,
-        "confusion_matrix_type": "counts; rows=true, columns=predicted",
-        "confusion_matrix": cm,
-    }
+from utils import LABELS, MODEL_ID, get_device, save_confusion, save_json, seed_everything, compute_svm_metrics
 
 
 def main():

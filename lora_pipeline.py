@@ -132,10 +132,12 @@ class ProjectionHead(nn.Module):
 class LinearClassifier(nn.Module):
     def __init__(self, dim=1024, classes=6):
         super().__init__()
-        self.linear = nn.Linear(dim, classes)
+        # self.linear = nn.Linear(dim, classes)
+        self.net = nn.Sequential(nn.Linear(dim, 256), nn.Linear(256, classes))
 
     def forward(self, x):
-        return self.linear(x)
+        # return self.linear(x)
+        return self.net(x)
 
 
 def masked_pool(output):
