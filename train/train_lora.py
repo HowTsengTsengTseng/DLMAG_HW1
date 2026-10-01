@@ -130,10 +130,11 @@ def recording_scores(logits, labels, n_records):
     ce = (-probs[torch.arange(n_records), y].clamp_min(1e-8).log()).mean().item()
     return probs, {"top1": top1, "top3": top3, "loss": ce}
 
+best = (-1, float("inf"))
 
-def probe(args):
+def probe(args, ckpt_path):
     seed_everything(args.seed); device = get_device(args.device)
-    train, val, _ = rows_for(args); ckpt, encoder, report = load_stage1(args.stage1, device)
+    train, val, _ = rows_for(args); ckpt, encoder, report = load_stage1(ckpt_path, device)
     xtr = fixed_crops(train, encoder.processor.sampling_rate, args.crop_seconds)
     xva = fixed_crops(val, encoder.processor.sampling_rate, args.crop_seconds)
     htr = pooled_crops(encoder, xtr, device, args.extract_batch_size); hva = pooled_crops(encoder, xva, device, args.extract_batch_size)
@@ -143,7 +144,7 @@ def probe(args):
     yva = torch.tensor([r["label_index"] for r in val]).repeat_interleave(3)
     model = LinearClassifier(htr.shape[1], 6); opt = torch.optim.AdamW(model.parameters(), lr=args.classifier_lr, weight_decay=args.classifier_weight_decay)
     loader = DataLoader(TensorDataset(htr, ytr), batch_size=args.classifier_batch_size, shuffle=True)
-    best = (-1, float("inf")); stale = 0; out = Path(args.output_dir); out.mkdir(parents=True, exist_ok=True)
+    global best; stale = 0; out = Path(args.output_dir); out.mkdir(parents=True, exist_ok=True)
     for epoch in range(1, args.classifier_epochs + 1):
         model.train()
         for x, y in loader:
@@ -167,6 +168,12 @@ def probe(args):
             save_confusion(metrics(probs.log(), torch.tensor([r["label_index"] for r in val]), LABELS[args.task]), out / "validation_confusion.png")
         else: stale += 1
         if stale >= args.classifier_patience: break
+
+
+def probe_all_checkpoints(args):
+    ckpt_paths = list(Path(args.stage1).glob("*.pt"))
+    for ckpt_path in ckpt_paths:
+        probe(args, ckpt_path)
 
 
 def probe_with_svm(args):
@@ -333,6 +340,7 @@ def main():
     p.add_argument("--ce-epochs", type=int, default=50);
     p.add_argument("--ce-warmup", type=int, default=4)
     p.add_argument("--svm", action="store_true")
+    p.add_argument("--probe-all", action="store_true")
     p.add_argument("--cache-dir", default="data/features")
     args = p.parse_args(); load_dotenv()
     if args.mode == "stage1": stage1(args)
@@ -340,8 +348,10 @@ def main():
         if not args.stage1: p.error("probe requires --stage1")
         if args.svm:
             probe_with_svm(args)
+        elif args.probe_all:
+            probe_all_checkpoints(args)
         else:
-            probe(args)
+            probe(args, args.stage1)
     else: ce_baseline(args)
 
 if __name__ == "__main__": main()
