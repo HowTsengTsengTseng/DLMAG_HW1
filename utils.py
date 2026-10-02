@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from sklearn.metrics import confusion_matrix
+from torch.nn.utils.rnn import pad_sequence
 
 LABELS = {
     "A": ["1960s", "1970s", "1980s", "1990s", "2000s", "2010s"],
@@ -84,3 +85,10 @@ def compute_svm_metrics(decision_scores, targets, labels):
         "confusion_matrix_type": "counts; rows=true, columns=predicted",
         "confusion_matrix": cm,
     }
+
+
+def collate_audio(batch):
+    waveforms, labels = zip(*batch)
+    # AudioDataset returns variable lengths for files shorter than --seconds.
+    waveforms = pad_sequence(waveforms, batch_first=True)
+    return waveforms, torch.stack(labels)

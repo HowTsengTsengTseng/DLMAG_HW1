@@ -20,6 +20,7 @@ dependencies = [
   "julius==0.2.8",
   "torch-pitch-shift==1.2.5",
   "torchaudio-augmentations==0.2.4",
+  "umap-learn>=0.5.7,<1",
 ]
 [dependency-groups]
 notebooks = ["jupyterlab>=4,<5", "ipykernel>=6,<7"]
