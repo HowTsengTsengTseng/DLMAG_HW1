@@ -8,8 +8,8 @@ Prediction:
   - Class prototypes (mean embeddings on the unit hypersphere) are computed for each class/era.
   - Test/Validation predictions are made purely by ranking cosine similarities between query embeddings
     and class prototypes: score(x, c) = (z_x . w_c) / tau.
-  - The final linear layer weights are fixed to these prototypes so that checkpoints remain 100% compatible
-    with test.py inference.
+  - The final linear layer weights are fixed to these prototypes so that checkpoints remain compatible
+    with inference/predict_mert.py.
 """
 import argparse
 from pathlib import Path

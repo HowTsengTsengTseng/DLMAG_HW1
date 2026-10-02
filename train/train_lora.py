@@ -19,7 +19,7 @@ from dotenv import load_dotenv
 from dataset import check_disjoint, read_manifest, TwoViewDataset, ClassBalancedBatchSampler
 from lora_pipeline import (fixed_crops, forward_h, make_lora_encoder, package_versions,
     save_json, trainable_report)
-from utils import LABELS, MODEL_ID, get_device, metrics, save_confusion, seed_everything, compute_svm_metrics, combine_and_record_scores
+from utils import LABELS, MODEL_ID, get_device, metrics, save_confusion, seed_everything, combine_and_record_scores
 from peft import TaskType, PeftType
 
 from models import ProjectionHead, LinearClassifier, NonLinearClassifier

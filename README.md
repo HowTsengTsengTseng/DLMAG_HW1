@@ -1,58 +1,68 @@
-# Homework 1：MERT-v2 + MLP
+# MERT Music Classification
 
-以凍結的 `m-a-p/MERT-v2-30s` 擷取音訊特徵，分別訓練 Dataset A（年代）與 Dataset B（發行市場）的六分類 MLP。這是初始化 codebase：尚未下載音訊／模型權重，也未執行訓練、推論或測試，沒有訓練結果或 checkpoint。
+This repository contains training and inference code for two six-class music
+classification tasks: **Dataset A**, which predicts a recording's decade, and
+**Dataset B**, which predicts its release market. The project includes frozen
+MERT feature classifiers, contrastive and Audio-SUC experiments, and LoRA-based
+MERT training workflows.
 
-## 目錄
+The repository contains source code and an example manifest only. Audio data,
+model weights, feature caches, and trained checkpoints are not included.
+
+## Project layout
 
 ```text
-models.py                 MERT encoder、標準化、MLP、SVM 與 Audio-SUC
-train/                    訓練腳本目錄
-  train.py                標準 Cross-Entropy 訓練
-  train_svm.py            MERT + SVM（支援自動 C 網格搜索與 PyTorch Checkpoint）
-  train_contrastive.py    Supervised Contrastive (SupCon) + CE 訓練
-  train_audiosuc.py       Audio-SUC 論文 CNN / Contrastive 訓練
-train.py                  根目錄捷徑訓練腳本
-test.py                   兩個任務的 test 推論與作業 JSON（不是單元測試）
-dataset.py                gdown 下載、安全解壓縮、manifest 轉換與音訊讀取
-features.py               依音訊內容與模型版本建立特徵快取
-utils.py                  標籤、random seed、metrics、混淆矩陣
-notebooks/01_workflow.ipynb 未執行的操作範例與結果檢視
-examples/manifest.csv      欄位示意，並非真實樣本
-pyproject.toml            uv 套件設定
-uv.lock                   跨平台依賴鎖定
-requirements.txt          由 uv 匯出，供助教 pip 安裝
-.env.example              自行填入 Hugging Face token
+dataset.py                 Download data and prepare manifests
+models.py                  MERT encoder, classifiers, and model utilities
+features.py                MERT feature extraction and cache
+loss.py                    Contrastive objectives
+augmentations.py            Audio augmentation helpers
+utils.py                   Labels, metrics, seeding, and plotting
+train/
+  train.py                 Frozen MERT features + MLP
+  train_contrastive.py     Frozen MERT features + contrastive classifier
+  train_audiosuc.py        Audio-SUC training workflow
+  train_lora.py            10-second LoRA stage1, probe, and CE workflows
+  train_lora_30s.py        30-second LoRA stage1 and probe workflows
+inference/
+  predict_mert.py          Frozen MERT MLP and contrastive checkpoints
+  predict_lora.py          LoRA probe and CE checkpoints
+  common.py                Shared test-manifest and submission helpers
+infer_lora.py              LoRA prediction entry point
+examples/manifest.csv      Manifest format example; contains no real samples
+pyproject.toml, uv.lock    Project dependencies and lockfile
+requirements.txt           Pip-compatible dependency list
 ```
 
-## 安裝
+## Setup
 
-需要 Python 3.11／3.12；建議使用 3.11。固定採用模型官方示範版本 Torch 2.6.0、torchaudio 2.6.0、Transformers 4.53.2。環境已用 uv 建立於 `.venv/`。
+Python 3.11 or 3.12 is required. The project pins PyTorch 2.6.0,
+torchaudio 2.6.0, and Transformers 4.53.2. Install the locked dependencies with
+[uv](https://docs.astral.sh/uv/):
 
 ```bash
-# 如 uv 尚未在 PATH，安裝：https://docs.astral.sh/uv/getting-started/installation/
 uv sync --frozen
-cp .env.example .env
-# 編輯 .env，把 HF_TOKEN 填入自己的 token
 ```
 
-本次初始化所用 uv 位於工作區 `work/bin/uv`。在本機新終端機，可先執行：
+Alternatively, install with pip:
 
 ```bash
-export PATH="/Users/cengchenghao/Documents/Codex/2026-09-19/files-mentioned-by-the-user-homework/work/bin:$PATH"
-cd /Users/cengchenghao/Documents/Codex/2026-09-19/files-mentioned-by-the-user-homework/outputs/mert-mlp
+pip install -r requirements.txt
 ```
 
-供助教使用的替代安裝方式：`pip install -r requirements.txt`，後續將 `uv run python` 改成 `python`。更新依賴後重新匯出：
+The first MERT training or inference run downloads the model from Hugging Face.
+Provide any required Hugging Face credentials in your environment; never commit
+tokens or a populated `.env` file.
 
-```bash
-uv export --frozen --no-dev --no-hashes --no-emit-project --output-file requirements.txt
-```
+### Workaround for missing SoX on Linux workstations
 
-### 工作站沒有 sudo：修補 site-packages 的 SoX import
+On Linux systems without `libsox.so`, importing the PyPI version of
+`torchaudio-augmentations` may fail while loading its `augment` dependency. If
+you cannot install SoX, the following workaround edits the installed package
+in the active virtual environment. These edits are local and may be overwritten
+by `uv sync`; reapply them after syncing if needed.
 
-Linux 工作站若沒有 `libsox.so`，直接 import PyPI 版 `torchaudio-augmentations` 可能在載入 `augment` 時失敗。以下是暫時性 workaround：直接修改目前 `.venv` 內的套件原始碼。這些修改不在 Git 中，之後執行 `uv sync` 可能被覆蓋；若要永久重現，應改用專案內的本地 augmentation source 或安裝系統／個人目錄的 SoX。
-
-先確認套件位置：
+Find the installed package directory:
 
 ```bash
 uv run python - <<'PY'
@@ -61,14 +71,9 @@ print(torchaudio_augmentations.__path__[0])
 PY
 ```
 
-通常會是 `.venv/lib/python3.11/site-packages/torchaudio_augmentations`。設定路徑後編輯：
-
-```bash
-TA_PATH="$PWD/.venv/lib/python3.11/site-packages/torchaudio_augmentations"
-nano "$TA_PATH/augmentations/pitch_shift.py"
-```
-
-將 `pitch_shift.py` 改成使用 `torch-pitch-shift`，移除 `import augment`：
+It is typically under `.venv/lib/python3.11/site-packages/torchaudio_augmentations`.
+In `augmentations/pitch_shift.py`, replace the `augment`-based implementation
+with `torch-pitch-shift`:
 
 ```python
 import random
@@ -114,13 +119,8 @@ class PitchShift:
         return self.process(audio)
 ```
 
-再編輯 Reverb：
-
-```bash
-nano "$TA_PATH/augmentations/reverb.py"
-```
-
-將檔案開頭的 `import augment` 改成：
+Then edit `augmentations/reverb.py`: replace its top-level `import augment` with
+the guarded import below, and add the fallback at the start of `forward`:
 
 ```python
 import torch
@@ -131,15 +131,16 @@ except (ImportError, OSError):
     augment = None
 ```
 
-並在 `forward` 的第一行加入：
-
 ```python
 def forward(self, audio):
     if augment is None:
         return audio.clone()
+    # Keep the existing Reverb implementation below this guard.
 ```
 
-沒有 SoX 時，Reverb 會退回原始音訊，但不會阻止其他 augmentation 執行。確認 Python 載入的是修改後的檔案：
+With no SoX library, Reverb returns an unchanged copy of the audio while other
+augmentations remain available. To check that Python imports the edited
+`PitchShift` implementation:
 
 ```bash
 uv run python - <<'PY'
@@ -149,213 +150,143 @@ print(inspect.getfile(PitchShift))
 PY
 ```
 
-最後執行 augmentation unittest：
 
-```bash
-uv run python -m unittest tests.test_augmentation -v
-```
+## Data and manifests
 
-若之後重新執行 `uv sync`，請重新套用以上修改；`uv sync` 不會保留直接編輯 `site-packages` 的內容。
-
-預設 `--device auto` 選 CUDA，沒有 CUDA 時使用 CPU。macOS 使用 CPU；沒有預設啟用 MPS。MERT 約 632M 參數，特徵擷取比 MLP 訓練耗費資源，預設 extraction batch size 為 1。顯存需求未實測；若 CUDA 記憶體不足，使用 CPU 或先減少音訊長度。改變長度需重新訓練以保持前處理一致。
-
-## 下載資料與建立 manifests
+Download and extract the official datasets under `data/raw`:
 
 ```bash
 uv run python dataset.py download --output data/raw
 ```
 
-此指令以 gdown 下載使用者指定的 [Drive 資料夾](https://drive.google.com/drive/folders/1C8RymiLbr-EGmkxh2Ap5TIybnJYqNsb4)，解壓縮兩個 ZIP，保留原始檔。公開目錄目前列出 `dataset_A.zip`、`dataset_B.zip`、`prediction_format_example_NOT_ANSWERS.json`；ZIP 合計約 3 GB。配額或權限問題會直接回報失敗，不會略過遺漏檔案。
+The downloader uses the assignment's [Google Drive folder](https://drive.google.com/drive/folders/1C8RymiLbr-EGmkxh2Ap5TIybnJYqNsb4).
+The expected official manifests are `data/raw/dataset_A/manifest.csv` and
+`data/raw/dataset_B/manifest.csv`, with audio files under each dataset's
+`audio/` directory. Keep the official train, validation, and test assignments.
 
-**資料結構已完成核對：**
-下載解壓縮後，官方檔案包含：
-- `data/raw/dataset_A/manifest.csv` 與 `data/raw/dataset_A/audio/*.wav` (A 共有 1026 train / 132 validation / 132 test)
-- `data/raw/dataset_B/manifest.csv` 與 `data/raw/dataset_B/audio/*.wav` (B 共有 798 train / 102 validation / 102 test)
-- 欄位包含 `sample_id`, `split`, `label`, `audio_path`, `duration_seconds`, `sample_rate`, `sha256`。
-
-可執行以下一鍵指令，自動從 raw 資料產生繳交所需的六個標準 split CSV：
+To export six canonical split manifests:
 
 ```bash
 uv run python dataset.py prepare-all
 ```
 
-產生清單：
-```text
-data/manifests/A_train.csv
-data/manifests/A_validation.csv
-data/manifests/A_test.csv
-data/manifests/B_train.csv
-data/manifests/B_validation.csv
-data/manifests/B_test.csv
-```
+This creates `data/manifests/{A,B}_{train,validation,test}.csv`. A manifest
+contains `sample_id`, `path`, and `label` columns; paths are resolved relative
+to `--data-root` (default `data/raw`). The labels are:
 
-每個 manifest 的格式：
-```csv
-sample_id,path,label
-<官方ID>,<相對於data-root的WAV路徑>,<官方標籤>
-```
+- Dataset A: `1960s`, `1970s`, `1980s`, `1990s`, `2000s`, `2010s`
+- Dataset B: `US`, `UK`, `Brazil`, `Spain`, `Germany`, `Italy`
 
-- A 標籤：`1960s, 1970s, 1980s, 1990s, 2000s, 2010s`。
-- B 標籤：`US, UK, Brazil, Spain, Germany, Italy`。
-- 數量核對完全符合：A 為 1026 / 132 / 132；B 為 798 / 102 / 102。
+Training scripts accept the combined official manifest and filter by split, or
+separate train and validation manifests. See each script's `--help` for options.
 
-## 架構與前處理
+## Training
 
-```text
-WAV → mono → 24 kHz → 中央最多30秒
-    → frozen MERT-v2 最後一層 → masked temporal mean pooling
-    → training-set standardization → L2 normalization
-    → Linear(1024,256) → GELU → Dropout(0.3) → Linear(256,6)
-```
+### Frozen MERT features and MLP
 
-聲道取平均；只在原取樣率不同時 resample。作業已提供中央 30 秒，因此預設不再隨機裁切。沒有額外音訊 augmentation。前處理經官方 feature extractor；輸出 frame mask 用於 pooling，排除 padding。使用 logits 配合 cross-entropy，分類排名等同 softmax 機率排名。
+The default classifier extracts frozen MERT-v2 features, applies training-set
+standardization and L2 normalization, then trains an MLP. The official combined
+manifest is discovered under `data/raw` by default:
 
-特徵快取 key 包含音訊 SHA256、Hugging Face commit、長度、取樣率與前處理版本。首次 train.py 才會從 Hugging Face 下載權重。checkpoint 固定儲存解析後的 commit；test.py 使用同一 commit 重新載入凍結 encoder。模型需要 `trust_remote_code=True`，載入指定 repo 的自訂模型程式。
-
-每個任務的 mean/std **只在 train features 估計**，並存成 MLP buffer。Validation 只用於 early stopping／選擇最佳 validation loss，不做梯度更新。Test 完全不參與 model selection。此版本只訓練 MLP，不做 MERT fine-tuning。
-
-## 執行訓練
-
-訓練腳本已自動支援官方 raw manifests 與標準化 manifests。以下兩種指令皆可執行：
-
-### 方式一：直接使用官方 raw manifest（最簡潔，自動切分 train/validation）
 ```bash
-uv run python train.py --task A --output-dir runs/A
-uv run python train.py --task B --output-dir runs/B
+uv run python train/train.py --task A --output-dir runs/A
+uv run python train/train.py --task B --output-dir runs/B
 ```
-*(腳本會自動讀取 `data/raw/dataset_A/manifest.csv` 與 `data/raw/dataset_B/manifest.csv` 並依 `split` 欄位篩選)*
 
-### 方式二：使用個別 manifest（相容官方標準切分檔）
+### Frozen-feature contrastive classifier
+
 ```bash
-uv run python train/train.py --task A --data-root data/raw \
-  --train-manifest data/manifests/A_train.csv \
-  --val-manifest data/manifests/A_validation.csv --output-dir runs/A
-
-uv run python train/train.py --task B --data-root data/raw \
-  --train-manifest data/manifests/B_train.csv \
-  --val-manifest data/manifests/B_validation.csv --output-dir runs/B
+uv run python train/train_contrastive.py --task A --output-dir runs/A_contrastive
+uv run python train/train_contrastive.py --task B --output-dir runs/B_contrastive
 ```
 
-### 方式三：使用 Audio-SUC 論文方法訓練（He et al., 2024）
+### Audio-SUC
+
 ```bash
-uv run python train/train_audiosuc.py --task A --output-dir runs/A_audiosuc \
-  --beta 0.5 --temperature 0.1
-
-uv run python train/train_audiosuc.py --task B --output-dir runs/B_audiosuc \
-  --beta 0.5 --temperature 0.1
+uv run python train/train_audiosuc.py --task A --output-dir runs/A_audiosuc
+uv run python train/train_audiosuc.py --task B --output-dir runs/B_audiosuc
 ```
-*(依論文 Section 2.2，同時以分類損失 $\mathcal{L}_{MLE}$ 與 Era Contrastive 損失 $\mathcal{L}_{EC}$ 訓練投影頭，推論使用分類頭 $f(h_a)$)*
 
-### 方式四：純 EC 對比損失訓練（Pure SupCon Prototype）
-```bash
-uv run python train/train_contrastive.py --task A --output-dir runs/A_contrastive \
-  --temperature 0.1
+### LoRA workflows
 
-uv run python train/train_contrastive.py --task B --output-dir runs/B_contrastive \
-  --temperature 0.1
-```
-*(完全不用 Cross-Entropy，以純 EC 對比損失拉近同類別並藉由類別中心原型 Prototype 進行餘弦相似度預測)*
-
-### 方式五：MERT + SVM（支援自動 C 網格搜索與最大邊界分類）
-```bash
-# 自動搜索最佳 C 值 (0.001 ~ 100.0)
-uv run python train/train_svm.py --task A --output-dir runs/A_svm --kernel linear
-uv run python train/train_svm.py --task B --output-dir runs/B_svm --kernel linear
-
-# 或指定特定 C 值
-uv run python train/train_svm.py --task A --output-dir runs/A_svm_c1 --kernel linear --c 1.0
-```
-*(在單位超球面 MERT 特徵上訓練 SVM 最大邊界分類器，自動挑選最佳 C，並將權重轉換為 PyTorch `best.pt`，與 `test.py` 100% 相容)*
-
-預設 AdamW、lr=0.001、weight decay=0.0001、batch size=64、最多100 epochs、patience=15、seed=42。輸出 `best.pt`、`config.json`、`history.json`、`validation_metrics.json`、`validation_confusion.png`。混淆矩陣是 counts，列為真實類別、欄為預測類別；Top-1／Top-3 是 0 到 1 的比例。固定 seed 仍可能因裝置／底層運算差異產生數值差異。
-
-已存在 `best.pt` 的 run 目錄不會被覆寫；請另選 `--output-dir`。目前不提供 optimizer resume。
-
-## 未來執行推論與提交
-
-### LoRA + standard SupCon pipeline
-
-The original frozen-feature MLP commands above remain supported. The following
-new entry point trains task-specific LoRA adapters on MERT-v2-30s. It verifies
-the actual remote model's attention module paths at runtime and records the
-resolved model revision and package versions in each output directory. PEFT is
-required (`uv sync` or `pip install -r requirements.txt`).
-
-Stage 1 uses two independently sampled 10-second views from two recordings per
-class and standard supervised contrastive loss. Checkpoints are written at
-epochs 5, 10, and 20 (or the configured maximum):
+The 10-second workflow supports supervised-contrastive adapter training
+(`stage1`), a linear probe (`probe`), and a joint LoRA + cross-entropy baseline
+(`ce`). For example:
 
 ```bash
 uv run python train/train_lora.py stage1 --task A --output-dir runs/A_lora_s1
-uv run python train/train_lora.py stage1 --task B --output-dir runs/B_lora_s1
-```
-
-Run the linear probe separately for each Stage 1 candidate. It extracts fixed
-0–10, 10–20, and 20–30 second crops, fits standardization on training crops,
-and selects by recording-level validation Top-1:
-
-```bash
-uv run python train/train_lora.py probe --task A --stage1 runs/A_lora_s1/epoch_010.pt --output-dir runs/A_lora_probe
-uv run python train/train_lora.py probe --task B --stage1 runs/B_lora_s1/epoch_010.pt --output-dir runs/B_lora_probe
-```
-
-The joint LoRA + CE baseline uses the same verified adapter placement and
-class-balanced two-view batches. Its direct pooled representation intentionally
-does not use the Stage 2 standardizer:
-
-```bash
+uv run python train/train_lora.py probe --task A \
+  --stage1 runs/A_lora_s1/epoch_010.pt --output-dir runs/A_lora_probe
 uv run python train/train_lora.py ce --task A --output-dir runs/A_lora_ce
-uv run python train/train_lora.py ce --task B --output-dir runs/B_lora_ce
 ```
 
-Generate assignment-compatible predictions with the shared three-crop
-probability-averaging path:
+The separate 30-second workflow provides `stage1` and `probe` modes:
 
 ```bash
-uv run python infer_lora.py --checkpoint-a runs/A_lora_probe/best.pt \
-  --checkpoint-b runs/B_lora_probe/best.pt --output predictions/lora.json
+uv run python train/train_lora_30s.py stage1 --task A --output-dir runs/A_lora_30s_s1
+uv run python train/train_lora_30s.py probe --task A \
+  --stage1 runs/A_lora_30s_s1 --output-dir runs/A_lora_30s_probe
 ```
 
-The implementation intentionally does not merge adapters. A checkpoint stores
-the pinned base model ID/revision, adapter weights, external classifier,
-standardization statistics when applicable, label order, crop/pooling policy,
-and validation metadata.
+Repeat any example with `--task B` for Dataset B. Training outputs are written
+to the requested run directory; use a new directory for each run.
+
+## Test-set inference
+
+Both inference scripts produce the assignment submission structure: a mapping
+from each test sample ID to its three highest-ranked labels. By default, test
+manifests are discovered from `data/raw/dataset_{A,B}/manifest.csv` or
+`data/manifests/{A,B}_test.csv` and filtered to the test split. Pass
+`--manifest-a` and `--manifest-b` to select other files.
+
+### Frozen MERT MLP or contrastive checkpoints
+
+`inference/predict_mert.py` supports checkpoints from `train/train.py` and
+`train/train_contrastive.py`:
 
 ```bash
-uv run python test.py --data-root /path/on/grader/device \
-  --manifest-a data/manifests/A_test.csv \
-  --manifest-b data/manifests/B_test.csv \
-  --checkpoint-a runs/A/best.pt --checkpoint-b runs/B/best.pt \
-  --template data/raw/prediction_format_example_NOT_ANSWERS.json \
-  --output predictions/STUDENT_ID.json
+uv run python inference/predict_mert.py \
+  --checkpoint-a runs/A/best.pt \
+  --checkpoint-b runs/B/best.pt \
+  --output predictions/mert.json
 ```
 
-如範例檔實際位於子目錄，調整 `--template` 路徑。它僅檢查 A/B 的 sample ID 集合完全一致，**不讀取範例答案來預測**；建議提交時保留此參數。輸出格式完全依作業第18頁：
+### LoRA probe or CE checkpoints
 
-```json
-{
-  "dataset_A": {"<A_sample_id>": ["2010s", "2000s", "1990s"]},
-  "dataset_B": {"<B_sample_id>": ["UK", "US", "Germany"]}
-}
-```
-
-上面僅為 schema 示意。實際標籤由模型分數排序，每個 manifest ID 恰好一次、各三個不重複標籤。
-
-上傳 source、兩個 `best.pt`、`requirements.txt`、README、manifests；不要上傳 `.env`、`.venv`、released dataset、模型 cache 或特徵 cache。這個凍結版本的 checkpoint 只含 MLP 與標準化參數，重現需要連線 Hugging Face 下載所記錄 commit 的 MERT，或事先備好對應 cache；HF token 由執行者提供。
-
-## Notebook 與作業剩餘工作
+`inference/predict_lora.py` supports classifier checkpoints from the LoRA
+training scripts:
 
 ```bash
-uv sync --frozen --group notebooks
-uv run --group notebooks jupyter lab
+uv run python inference/predict_lora.py \
+  --checkpoint-a runs/A_lora_probe/best.pt \
+  --checkpoint-b runs/B_lora_probe/best.pt \
+  --output predictions/lora.json
 ```
 
-Notebook 保留未執行狀態，不會自動啟動訓練。作業另有 audio language model／prompt 比較、報告 PDF、錯誤分析與最終提交等要求；本次依你的範圍只初始化 MERT+MLP codebase，沒有實作 audio language model 實驗，也沒有產生或聲稱完成實驗結果。
+The 10-second LoRA workflow uses three fixed crops and averages their
+probabilities; the 30-second probe uses one full recording per sample. A LoRA
+`stage1` checkpoint has no classifier, so run `probe` or `ce` before prediction.
 
-## 參考來源
+Both prediction scripts can validate their output against an optional
+assignment template using `--template`. The template is used to check sample
+IDs; its example rankings are not used as predictions. Choose the inference
+entry point and checkpoint type that match the model being submitted.
 
-- 使用者提供的 Homework 1.pdf：任務、split 數量、標籤、評估與提交格式。
-- [MERT-v2-30s model card](https://huggingface.co/m-a-p/MERT-v2-30s)：載入方式與輸出介面。權重授權 CC BY-NC 4.0。
-- [MERT 官方程式庫](https://github.com/yizhilll/MERT)：MERT 研究背景。
-- [gdown](https://github.com/wkentaro/gdown)：公開 Google Drive 下載。
-- [uv 文件](https://docs.astral.sh/uv/)：環境與套件管理。
+## Model and evaluation notes
+
+The frozen-feature MLP path converts audio to mono, resamples to 24 kHz, and
+uses up to 30 seconds of audio with the frozen MERT-v2 encoder. Its default
+head is `Linear(1024, 256)`, GELU, dropout, and a six-class output layer.
+Training-set statistics are stored with the checkpoint. Validation is used for
+model selection; test labels are not used for training or selection.
+
+MERT is a large model, and feature extraction can require substantial compute
+and memory. The frozen-feature scripts default to automatic CPU/CUDA selection
+and extraction batch size 1. CUDA memory requirements have not been measured in
+this repository.
+
+## References
+
+- [MERT-v2-30s model card](https://huggingface.co/m-a-p/MERT-v2-30s)
+- [MERT research repository](https://github.com/yizhilll/MERT)
+- [uv documentation](https://docs.astral.sh/uv/)
