@@ -186,8 +186,10 @@ def probe(args, ckpt_path):
             best, stale = (score["top1"], score["loss"]), 0
             torch.save({"format_version": 2, "kind": "mert_lora_probe", "task": args.task, "labels": LABELS[args.task],
                 "model_id": ckpt["model_id"], "revision": ckpt["revision"], "adapter_state": ckpt["adapter_state"],
-                "adapter_epoch": ckpt["adapter_epoch"], "model_args": {"input_dim": htr.shape[1], "num_classes": 6},
+                "adapter_epoch": ckpt["adapter_epoch"], "stage1_checkpoint": str(ckpt_path),
+                "model_args": {"input_dim": htr.shape[1], "num_classes": 6},
                 "classifier_state": model.state_dict(), "feature_mean": mean, "feature_std": std,
+                "projection_state": {k: v.detach().cpu() for k, v in ckpt["projection_state"].items()},
                 "lora": ckpt.get("lora", args.lora),
                 "crop_seconds": args.crop_seconds, "pooling": "feature_attention_mask_mean", "metrics": score,
                 "train_ids": [r["sample_id"] for r in train], "validation_ids": [r["sample_id"] for r in val],
@@ -196,18 +198,38 @@ def probe(args, ckpt_path):
             save_confusion(metrics(probs.log(), torch.tensor([r["label_index"] for r in val]), LABELS[args.task]), out / "validation_confusion.png")
         else: stale += 1
         if stale >= args.classifier_patience: break
-    if args.visualize:
+    if args.visualize and not args.probe_all:
         projection = ProjectionHead(encoder.hidden_size).to(device)
         projection.load_state_dict(ckpt["projection_state"])
         visualize_lora(args, encoder, train + val, out, projection, prefix="lora_probe_backbone")
 
 
 def probe_all_checkpoints(args):
-    ckpt_paths = list(Path(args.stage1).glob("*.pt"))
+    ckpt_paths = sorted(Path(args.stage1).glob("*.pt"))
+    if not ckpt_paths:
+        raise FileNotFoundError(f"No stage1 checkpoints (*.pt) found in {args.stage1}")
+    global best
+    best = (-1, float("inf"))
+    visualize_after_sweep = args.visualize
+    args.visualize = False
     for ckpt_path in ckpt_paths:
+        print(f"Probing stage1 checkpoint: {ckpt_path}", flush=True)
         probe(args, ckpt_path)
-ß
-
+    args.visualize = visualize_after_sweep
+    best_path = Path(args.output_dir) / "best.pt"
+    if not best_path.exists():
+        raise RuntimeError("Probe sweep completed without producing a best.pt checkpoint")
+    winning = torch.load(best_path, map_location="cpu", weights_only=True)
+    print(f"Global best probe checkpoint: {best_path} "
+          f"(stage1 epoch {winning['adapter_epoch']}, metrics={winning['metrics']})", flush=True)
+    if visualize_after_sweep:
+        device = get_device(args.device)
+        _, encoder, _ = load_stage1(best_path, device)
+        projection = ProjectionHead(encoder.hidden_size).to(device)
+        projection.load_state_dict(winning["projection_state"])
+        train, val, _ = rows_for(args)
+        visualize_lora(args, encoder, train + val, Path(args.output_dir), projection,
+                       prefix="lora_probe_all_global_best")
 def ce_baseline(args):
     CLF = get_classifier(args.classifier)
     seed_everything(args.seed); device = get_device(args.device); train, val, _ = rows_for(args)
@@ -261,13 +283,13 @@ def main():
     p.add_argument("--crop-seconds", type=float, default=10);
     p.add_argument("--extract-batch-size", type=int, default=16)
     p.add_argument("--classes-per-batch", type=int, default=6);
-    p.add_argument("--recordings-per-class", type=int, default=2);
+    p.add_argument("--recordings-per-class", type=int, default=10);
     p.add_argument("--batches-per-epoch", type=int, default=0);
     p.add_argument("--temperature", type=float, default=.1);
     p.add_argument("--adapter-lr", type=float, default=1e-4);
     p.add_argument("--projection-lr", type=float, default=3e-4);
     p.add_argument("--weight-decay", type=float, default=.01);
-    p.add_argument("--epochs", type=int, default=20);
+    p.add_argument("--epochs", type=int, default=100);
     p.add_argument("--lora", type=json.loads, default={"r":8,"alpha":16,"dropout":.05})
     p.add_argument("--stage1");
     p.add_argument("--std-floor", type=float, default=1e-6);
@@ -288,7 +310,7 @@ def main():
         if not args.stage1: p.error("probe requires --stage1")
 
         if args.probe_all:
-            probe_all_checkpoints(args, args.stage1)
+            probe_all_checkpoints(args)
         else:
             probe(args, args.stage1)
     else: ce_baseline(args)
