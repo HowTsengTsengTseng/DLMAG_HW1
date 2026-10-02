@@ -20,13 +20,11 @@ from dataset import check_disjoint, read_manifest, TwoViewDataset, ClassBalanced
 from lora_pipeline import (fixed_crops, forward_h, make_lora_encoder, package_versions,
     save_json, trainable_report)
 from utils import LABELS, MODEL_ID, get_device, metrics, save_confusion, seed_everything, compute_svm_metrics, combine_and_record_scores
-from features import extract_features
 from peft import TaskType, PeftType
 
-from sklearn.svm import LinearSVC
-import numpy as np
-from models import SVMClassifier, ProjectionHead, LinearClassifier, NonLinearClassifier
+from models import ProjectionHead, LinearClassifier, NonLinearClassifier
 from loss import supcon_loss
+from visualize import add_visualization_args, save_embedding_visualizations
 
 torch.serialization.add_safe_globals([TaskType, PeftType])
 
@@ -64,6 +62,26 @@ def save_stage1(path, epoch, args, encoder, projection, report):
         "lora": args.lora, "crop_seconds": args.crop_seconds, "pooling": "feature_attention_mask_mean",
         "temperature": args.temperature, "seed": args.seed, "reports": report,
         "package_versions": package_versions()}, path)
+
+
+@torch.no_grad()
+def visualize_lora(args, encoder, rows, output, projection=None, prefix="mert_lora"):
+    """Extract deterministic fixed-crop h (and optional projection z) for plotting."""
+    crops = fixed_crops(rows, encoder.processor.sampling_rate, args.crop_seconds)
+    h = pooled_crops(encoder, crops, get_device(args.device), args.extract_batch_size)
+    targets = torch.tensor([row["label_index"] for row in rows]).repeat_interleave(3)
+    representations = {"h": h}
+    if projection is not None:
+        projection.eval()
+        representations["z"] = torch.cat([
+            projection(batch.to(get_device(args.device))).float().cpu()
+            for batch in h.split(args.extract_batch_size)
+        ])
+    crop_ids = [f"{row['sample_id']}#crop{crop}" for row in rows for crop in range(3)]
+    paths = save_embedding_visualizations(
+        representations, targets, LABELS[args.task], args, output,
+        prefix=prefix, sample_ids=crop_ids)
+    print("Saved embedding visualizations: " + ", ".join(str(path) for path in paths.values()))
 
 
 def parameter_groups(named_parameters, lr, weight_decay):
@@ -112,6 +130,14 @@ def stage1(args):
         print(f"epoch={epoch} supcon={loss_sum / len(loader):.5f}", flush=True)
         if epoch % 5 == 0:
             save_stage1(out / f"epoch_{epoch:03d}.pt", epoch, args, encoder, projection, report)
+    final_checkpoint = out / f"epoch_{args.epochs:03d}.pt"
+    if args.epochs % 5:
+        save_stage1(final_checkpoint, args.epochs, args, encoder, projection, report)
+    if args.visualize:
+        ckpt, encoder, _ = load_stage1(final_checkpoint, device)
+        projection = ProjectionHead(encoder.hidden_size).to(device)
+        projection.load_state_dict(ckpt["projection_state"])
+        visualize_lora(args, encoder, train + val, out, projection, prefix="lora_stage1")
 
 
 @torch.no_grad()
@@ -170,112 +196,17 @@ def probe(args, ckpt_path):
             save_confusion(metrics(probs.log(), torch.tensor([r["label_index"] for r in val]), LABELS[args.task]), out / "validation_confusion.png")
         else: stale += 1
         if stale >= args.classifier_patience: break
+    if args.visualize:
+        projection = ProjectionHead(encoder.hidden_size).to(device)
+        projection.load_state_dict(ckpt["projection_state"])
+        visualize_lora(args, encoder, train + val, out, projection, prefix="lora_probe_backbone")
 
 
 def probe_all_checkpoints(args):
     ckpt_paths = list(Path(args.stage1).glob("*.pt"))
     for ckpt_path in ckpt_paths:
         probe(args, ckpt_path)
-
-
-def probe_with_svm(args):
-    seed_everything(args.seed); device = get_device(args.device)
-    train_rows, val_rows, labels = rows_for(args);
-    ckpt, encoder, report = load_stage1(args.stage1, device)
-    revision, input_dim = encoder.revision, encoder.hidden_size
-    features = [extract_features(rows, encoder, args.cache_dir, args.model_id) for rows in (train_rows, val_rows)]
-    del encoder
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-
-    labels = LABELS[args.task]
-    x_train, x_val = features
-    y_train = np.array([labels.index(r["label"]) for r in train_rows])
-    y_val = np.array([labels.index(r["label"]) for r in val_rows])
-
-    c_candidates = [0.001, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 50.0, 100.0]
-    best_c = None
-    best_score = -1.0
-    best_top3 = -1.0
-    best_clf = None
-    best_metrics = None
-    grid_results = []
-
-    mean = x_train.mean(0); std = x_train.std(0, unbiased=False).clamp_min(10e-6)
-    x_train_norm = (x_train - mean) / std
-    x_val_norm = (x_val - x_val.mean(0)) / x_val.std(0, unbiased=False).clamp_min(10e-6)
-    for c_val in c_candidates:
-        clf = LinearSVC(C=c_val, random_state=args.seed, max_iter=5000, dual="auto")
-        clf.fit(x_train_norm, y_train)
-
-        # Compute decision function scores on validation set
-        val_scores = clf.decision_function(x_val_norm)
-        scores = compute_svm_metrics(val_scores, y_val, labels)
-
-        grid_results.append({"C": c_val, "top1": scores["top1"], "top3": scores["top3"]})
-        print(f"C={c_val:>7.3f} | Val Top-1: {scores['top1']*100:.2f}% | Val Top-3: {scores['top3']*100:.2f}%")
-
-        # Select by Top-1 accuracy (tie-break on Top-3)
-        if (scores["top1"] > best_score) or (scores["top1"] == best_score and scores["top3"] > best_top3):
-            best_score = scores["top1"]
-            best_top3 = scores["top3"]
-            best_c = c_val
-            best_clf = clf
-            best_metrics = scores
-
-    print(f"\nBest C={best_c} -> Val Top-1: {best_score*100:.2f}%, Val Top-3: {best_top3*100:.2f}%")
-
-    # Save PyTorch-compatible SVMClassifier for seamless test.py evaluation
-    model_args = dict(input_dim=input_dim, num_classes=6)
-    py_model = SVMClassifier(**model_args)
-    py_model.feature_mean.copy_(mean)
-    py_model.feature_std.copy_(std)
-
-    py_model.set_weights(best_clf.coef_, best_clf.intercept_)
-
-    # Verify exact equivalence between PyTorch model and sklearn LinearSVC
-    py_model.eval()
-    with torch.no_grad():
-        py_logits = py_model(x_val).numpy()
-    sk_logits = best_clf.decision_function(x_val_norm)
-    assert np.allclose(py_logits, sk_logits, atol=1e-4), "PyTorch and sklearn decision functions diverged!"
-
-    out = Path(args.output_dir); out.mkdir(parents=True, exist_ok=True)
-    checkpoint = {
-        "format_version": 1,
-        "model_class": "SVMClassifier",
-        "task": args.task,
-        "labels": labels,
-        "model_id": args.model_id,
-        "revision": revision,
-        # "seconds": args.seconds,
-        "model_args": model_args,
-        "state_dict": {k: v.detach().cpu() for k, v in py_model.state_dict().items()},
-        "best_C": best_c,
-        # "seed": args.seed,
-        "train_ids": [r["sample_id"] for r in x_train],
-        "validation_ids": [r["sample_id"] for r in x_val],
-    }
-
-    torch.save(checkpoint, out / "best.pt")
-    save_json(out / "config.json", vars(args) | {
-        "resolved_revision": revision,
-        "labels": labels,
-        "best_C": best_c,
-        "grid_results": grid_results,
-    })
-    save_json(out / "validation_metrics.json", best_metrics | {"best_C": best_c})
-    save_confusion(best_metrics, out / "validation_confusion.png")
-
-    # Also save raw sklearn model via joblib if available
-    try:
-        import joblib
-        joblib.dump(best_clf, out / "best_svm.joblib")
-    except Exception:
-        pass
-
-    print(f"Saved PyTorch-compatible checkpoint: {out / 'best.pt'}")
-
+ß
 
 def ce_baseline(args):
     CLF = get_classifier(args.classifier)
@@ -307,6 +238,11 @@ def ce_baseline(args):
             torch.save({"format_version": 2, "kind": "mert_lora_ce", "task": args.task, "labels": LABELS[args.task], "model_id": args.model_id, "revision": encoder.revision, "adapter_state": {k:v.cpu() for k,v in get_peft_model_state_dict(encoder.backbone).items()}, "classifier_state": {k:v.cpu() for k,v in model.state_dict().items()}, "lora": args.lora, "crop_seconds": args.crop_seconds, "pooling": "feature_attention_mask_mean", "metrics": score, "package_versions": package_versions()}, out / "best.pt")
             save_json(out / "validation_metrics.json", score | {"epoch": epoch})
             save_confusion(metrics(probs.log(), torch.tensor([r["label_index"] for r in val]), LABELS[args.task]), out / "validation_confusion.png")
+    if args.visualize:
+        best_ckpt = torch.load(out / "best.pt", map_location="cpu", weights_only=True)
+        from peft import set_peft_model_state_dict
+        set_peft_model_state_dict(encoder.backbone, best_ckpt["adapter_state"])
+        visualize_lora(args, encoder, train + val, out, projection=None, prefix="lora_ce")
 
 
 def main():
@@ -335,7 +271,7 @@ def main():
     p.add_argument("--lora", type=json.loads, default={"r":8,"alpha":16,"dropout":.05})
     p.add_argument("--stage1");
     p.add_argument("--std-floor", type=float, default=1e-6);
-    p.add_argument("--classifier", type=str, default="linear", choices=["linear", "svm", "nonlinear"]);
+    p.add_argument("--classifier", type=str, default="linear", choices=["linear", "nonlinear"]);
     p.add_argument("--classifier-lr", type=float, default=1e-5);
     p.add_argument("--classifier-weight-decay", type=float, default=1e-4);
     p.add_argument("--classifier-batch-size", type=int, default=64);
@@ -345,13 +281,11 @@ def main():
     p.add_argument("--ce-warmup", type=int, default=4)
     p.add_argument("--probe-all", action="store_true")
     p.add_argument("--cache-dir", default="data/features")
+    add_visualization_args(p)
     args = p.parse_args(); load_dotenv()
     if args.mode == "stage1": stage1(args)
     elif args.mode == "probe":
         if not args.stage1: p.error("probe requires --stage1")
-
-        if args.classifier == "svm":
-            probe_with_svm(args)
 
         if args.probe_all:
             probe_all_checkpoints(args, args.stage1)

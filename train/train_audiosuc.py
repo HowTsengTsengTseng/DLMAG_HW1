@@ -13,7 +13,7 @@ from dataset import AudioDataset, check_disjoint, read_manifest, LabeledAudioDat
 from loss import EraContrastiveLoss
 from models import AudioSUCCNNv2, LinearClassifier
 from utils import LABELS, get_device, metrics, save_confusion, save_json, seed_everything, collate_audio
-from visualize import save_embedding_visualizations
+from visualize import add_visualization_args, save_embedding_visualizations
 
 
 
@@ -105,14 +105,7 @@ def main():
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--temperature", "--tau", type=float, default=0.1,
                         help="Temperature for the era contrastive loss")
-    parser.add_argument("--tsne-max-samples", type=int, default=2000,
-                        help="Maximum stratified train+validation examples used for the t-SNE plot")
-    parser.add_argument("--tsne-perplexity", type=float, default=30,
-                        help="t-SNE perplexity (capped automatically for small datasets)")
-    parser.add_argument("--umap-n-neighbors", type=int, default=15,
-                        help="UMAP neighborhood size (capped automatically for small datasets)")
-    parser.add_argument("--umap-min-dist", type=float, default=0.1,
-                        help="UMAP minimum distance between points in the 2D layout")
+    add_visualization_args(parser)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -133,8 +126,8 @@ def main():
         parser.error("seconds must be in (0, 30]")
     if args.lr <= 0 or args.weight_decay < 0 or args.temperature <= 0:
         parser.error("lr and temperature must be positive; weight-decay and beta must be non-negative")
-    if args.tsne_max_samples < 3 or args.tsne_perplexity <= 0 or args.umap_n_neighbors < 2:
-        parser.error("tsne-max-samples must be at least 3, perplexity positive, and umap-n-neighbors at least 2")
+    if args.visualize_max_samples < 3 or args.tsne_perplexity <= 0 or args.umap_n_neighbors < 2:
+        parser.error("visualize-max-samples must be at least 3, perplexity positive, and umap-n-neighbors at least 2")
     if not 0 <= args.umap_min_dist <= 1:
         parser.error("umap-min-dist must be between 0 and 1")
 
@@ -220,13 +213,26 @@ def main():
     best = torch.load(output / "best.pt", map_location=device, weights_only=True)
     model.load_state_dict(best["backbone_state_dict"], strict=True)
     clf.load_state_dict(best["clf_state_dict"], strict=True)
-    all_rows = train_rows + val_rows
-    all_labels = torch.cat((y_train, y_val))
-    tsne_path, umap_path = save_embedding_visualizations(
-        model, all_rows, all_labels, labels, args, device, output)
+    if args.visualize:
+        all_rows = train_rows + val_rows
+        all_labels = torch.cat((y_train, y_val))
+        all_ds = LabeledAudioDataset(
+            AudioDataset(all_rows, sampling_rate=args.sample_rate, seconds=args.seconds), all_labels)
+        all_loader = DataLoader(all_ds, batch_size=args.batch_size, shuffle=False,
+                                collate_fn=collate_audio)
+        model.eval()
+        h_values, z_values = [], []
+        with torch.no_grad():
+            for waveforms, _ in all_loader:
+                h = model.encode(waveforms.to(device))
+                z = model.embed(h)
+                h_values.append(h.cpu()); z_values.append(z.cpu())
+        paths = save_embedding_visualizations(
+            {"h": torch.cat(h_values), "z": torch.cat(z_values)}, all_labels,
+            labels, args, output, prefix="audiosuc",
+            sample_ids=[row["sample_id"] for row in all_rows])
+        print("Saved embedding visualizations: " + ", ".join(str(path) for path in paths.values()))
     print(f"Best checkpoint saved to: {output / 'best.pt'}")
-    print(f"t-SNE plot saved to: {tsne_path}")
-    print(f"UMAP plot saved to: {umap_path}")
 
 
 if __name__ == "__main__":

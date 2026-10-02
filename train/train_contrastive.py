@@ -29,6 +29,7 @@ from features import extract_features
 from models import MERTEncoder, MLPClassifier
 from utils import LABELS, MODEL_ID, get_device, metrics, save_confusion, save_json, seed_everything
 from loss import EraContrastiveLoss
+from visualize import add_visualization_args, save_embedding_visualizations
 
 
 @torch.no_grad()
@@ -71,6 +72,7 @@ def main():
                         help="Temperature tau for EC contrastive loss (default: 0.1)")
     parser.add_argument("--with-augmentation", action="store_true",
                         help="Use augmentation for training")
+    add_visualization_args(parser)
     args = parser.parse_args()
 
     if args.manifest:
@@ -221,7 +223,23 @@ def main():
             print(f"Early stopping triggered after {args.patience} epochs without improvement.")
             break
 
-    print(f"Best checkpoint saved to: {output / 'best.pt'}")
+    best_path = output / "best.pt"
+    print(f"Best checkpoint saved to: {best_path}")
+    if args.visualize:
+        best = torch.load(best_path, map_location="cpu", weights_only=True)
+        model.load_state_dict(best["state_dict"], strict=True)
+        model.eval()
+        x_all = torch.cat((x_train, x_val))
+        y_all = torch.cat((y_train, y_val))
+        with torch.no_grad():
+            z_all = torch.cat([
+                model.encode(x.to(device)).cpu()
+                for x in x_all.split(args.batch_size)
+            ])
+        paths = save_embedding_visualizations(
+            {"h": x_all, "z": z_all}, y_all, labels, args, output,
+            prefix="contrastive", sample_ids=[r["sample_id"] for r in train_rows + val_rows])
+        print("Saved embedding visualizations: " + ", ".join(str(path) for path in paths.values()))
 
 
 if __name__ == "__main__":
