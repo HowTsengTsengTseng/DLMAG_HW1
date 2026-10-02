@@ -144,6 +144,44 @@ class TwoViewDataset(Dataset):
         return views[0], views[1], int(self.rows[index]["label_index"])
 
 
+class FullAudioTwoViewDataset(Dataset):
+    """Load a full 30-second recording and independently augment two views."""
+
+    def __init__(self, rows, sample_rate=24000, seconds=30.0, transform=None):
+        if not 0 < seconds <= 30:
+            raise ValueError("seconds must be in (0, 30]")
+        self.rows = rows
+        self.sample_rate = sample_rate
+        self.target_samples = round(sample_rate * seconds)
+        self.audio = AudioDataset(rows, sample_rate, seconds=seconds)
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.rows)
+
+    def _view(self, wave):
+        wave = wave[:self.target_samples]
+        if wave.numel() < self.target_samples:
+            wave = torch.nn.functional.pad(wave, (0, self.target_samples - wave.numel()))
+        # torchaudio-augmentations expects [channels, samples]. Crop/pad after
+        # transforms too, since some reverb implementations append a tail.
+        view = wave.unsqueeze(0)
+        if self.transform is not None:
+            view = self.transform(view.clone())
+        view = view.reshape(-1)[:self.target_samples]
+        if view.numel() < self.target_samples:
+            view = torch.nn.functional.pad(view, (0, self.target_samples - view.numel()))
+        if not torch.isfinite(view).all():
+            raise ValueError("Audio augmentation produced non-finite samples")
+        return view
+
+    def __getitem__(self, index):
+        wave = torch.as_tensor(self.audio[index], dtype=torch.float32)
+        view1 = self._view(wave)
+        view2 = self._view(wave)
+        return view1, view2, int(self.rows[index]["label_index"])
+
+
 class ClassBalancedBatchSampler:
     def __init__(self, rows, classes=6, recordings_per_class=2, batches=0):
         self.by_class = {c: [i for i, r in enumerate(rows) if r["label_index"] == c]

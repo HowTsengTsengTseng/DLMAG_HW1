@@ -6,12 +6,8 @@ from pathlib import Path
 import torch
 from tqdm import tqdm
 
+from augmentations import make_audio_augmentation
 from dataset import AudioDataset
-
-from torchaudio_augmentations import (
-    Delay, Gain, Noise, PitchShift, PolarityInversion,
-    RandomApply, Reverb, Compose
-)
 
 
 def extract_features(rows, encoder, cache_dir, model_id, seconds=30, batch_size=1, with_transforms=False):
@@ -19,18 +15,7 @@ def extract_features(rows, encoder, cache_dir, model_id, seconds=30, batch_size=
         raise ValueError("batch_size must be positive and seconds must be in (0, 30]")
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    transform = Compose([
-        RandomApply([PolarityInversion()], p=0.8),
-        RandomApply([Noise(min_snr=0.001, max_snr=0.005)], p=0.3),
-        RandomApply([Gain()], p=0.2),
-        # HighLowPass(sample_rate=encoder.processor.sampling_rate),
-        RandomApply([Delay(sample_rate=encoder.processor.sampling_rate)], p=0.5),
-        RandomApply([PitchShift(
-            n_samples=encoder.processor.sampling_rate * seconds,
-            sample_rate=encoder.processor.sampling_rate,
-        )], p=0.4),
-        RandomApply([Reverb(sample_rate=encoder.processor.sampling_rate)], p=0.3)
-    ])
+    transform = make_audio_augmentation(encoder.processor.sampling_rate, seconds)
 
     dataset = AudioDataset(rows, encoder.processor.sampling_rate, seconds, transform if with_transforms else None)
     result = []

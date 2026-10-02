@@ -230,6 +230,8 @@ def probe_all_checkpoints(args):
         train, val, _ = rows_for(args)
         visualize_lora(args, encoder, train + val, Path(args.output_dir), projection,
                        prefix="lora_probe_all_global_best")
+
+
 def ce_baseline(args):
     CLF = get_classifier(args.classifier)
     seed_everything(args.seed); device = get_device(args.device); train, val, _ = rows_for(args)
