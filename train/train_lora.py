@@ -312,7 +312,7 @@ def main():
     p.add_argument("--classifier-lr", type=float, default=1e-5);
     p.add_argument("--classifier-weight-decay", type=float, default=1e-4);
     p.add_argument("--classifier-batch-size", type=int, default=64);
-    p.add_argument("--classifier-epochs", type=int, default=50);
+    p.add_argument("--classifier-epochs", type=int, default=100);
     p.add_argument("--classifier-patience", type=int, default=15);
     p.add_argument("--ce-epochs", type=int, default=50);
     p.add_argument("--ce-warmup", type=int, default=4)
