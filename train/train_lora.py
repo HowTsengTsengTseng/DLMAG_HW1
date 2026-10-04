@@ -172,7 +172,10 @@ def probe(args, ckpt_path):
     yva = torch.tensor([r["label_index"] for r in val]).repeat_interleave(3)
     model = CLF(htr.shape[1], 6); opt = torch.optim.AdamW(model.parameters(), lr=args.classifier_lr, weight_decay=args.classifier_weight_decay)
     loader = DataLoader(TensorDataset(htr, ytr), batch_size=args.classifier_batch_size, shuffle=True)
-    global best; stale = 0; out = Path(args.output_dir); out.mkdir(parents=True, exist_ok=True)
+    global best
+    checkpoint_best = (-1, float("inf"))
+    stale = 0
+    out = Path(args.output_dir); out.mkdir(parents=True, exist_ok=True)
     for epoch in range(1, args.classifier_epochs + 1):
         model.train()
         for x, y in loader:
@@ -182,8 +185,19 @@ def probe(args, ckpt_path):
         probs, score = combine_and_record_scores(logits, yva, len(val));
         print(f"epoch={epoch} {score}")
         key = (score["top1"], -score["loss"])
+        # Patience is local to this stage1 checkpoint. A checkpoint should
+        # keep training while its own validation score is improving, even if
+        # it has not surpassed the best result from another checkpoint.
+        if key > (checkpoint_best[0], -checkpoint_best[1]):
+            checkpoint_best = (score["top1"], score["loss"])
+            stale = 0
+        else:
+            stale += 1
+
+        # `best` is global across probe-all; only this comparison controls
+        # which checkpoint and classifier are written to best.pt.
         if key > (best[0], -best[1]):
-            best, stale = (score["top1"], score["loss"]), 0
+            best = (score["top1"], score["loss"])
             torch.save({"format_version": 2, "kind": "mert_lora_probe", "task": args.task, "labels": LABELS[args.task],
                 "model_id": ckpt["model_id"], "revision": ckpt["revision"], "adapter_state": ckpt["adapter_state"],
                 "adapter_epoch": ckpt["adapter_epoch"], "stage1_checkpoint": str(ckpt_path),
@@ -196,7 +210,6 @@ def probe(args, ckpt_path):
                 "package_versions": package_versions()}, out / "best.pt")
             save_json(out / "validation_metrics.json", score | {"epoch": epoch})
             save_confusion(metrics(probs.log(), torch.tensor([r["label_index"] for r in val]), LABELS[args.task]), out / "validation_confusion.png")
-        else: stale += 1
         if stale >= args.classifier_patience: break
     if args.visualize and not args.probe_all:
         projection = ProjectionHead(encoder.hidden_size).to(device)
