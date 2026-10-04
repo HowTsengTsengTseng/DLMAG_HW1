@@ -84,21 +84,27 @@ def save_checkpoint(path, epoch, args, encoder, projection, report):
 
 
 @torch.no_grad()
-def visualize_full_recordings(args, encoder, projection, rows, output):
+def visualize_full_recordings(args, encoder, projection, rows, output,
+                              prefix="lora_30s_supcon"):
     dataset = AudioDataset(rows, encoder.processor.sampling_rate, seconds=FULL_SECONDS)
     loader = DataLoader(dataset, batch_size=args.extract_batch_size, shuffle=False,
                         collate_fn=lambda batch: pad_sequence(batch, batch_first=True))
     encoder.eval()
-    projection.eval()
+    if projection is not None:
+        projection.eval()
     h_values, z_values = [], []
     for waveforms in loader:
         h = forward_h(encoder, waveforms)
         h_values.append(h.float().cpu())
-        z_values.append(projection(h).float().cpu())
+        if projection is not None:
+            z_values.append(projection(h).float().cpu())
     labels = torch.tensor([row["label_index"] for row in rows], dtype=torch.long)
+    representations = {"h": torch.cat(h_values)}
+    if projection is not None:
+        representations["z"] = torch.cat(z_values)
     paths = save_embedding_visualizations(
-        {"h": torch.cat(h_values), "z": torch.cat(z_values)}, labels,
-        LABELS[args.task], args, output, prefix="lora_30s_supcon",
+        representations, labels,
+        LABELS[args.task], args, output, prefix=prefix,
         sample_ids=[row["sample_id"] for row in rows],
     )
     print("Saved embedding visualizations: " + ", ".join(str(path) for path in paths.values()))
@@ -321,10 +327,133 @@ def train(args):
         visualize_full_recordings(args, encoder, projection, train_rows + val_rows, output)
 
 
+def train_ce(args):
+    """Train the LoRA encoder directly with cross-entropy on augmented 30s views."""
+    from peft import get_peft_model_state_dict, set_peft_model_state_dict
+
+    seed_everything(args.seed)
+    device = get_device(args.device)
+    output = Path(args.output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    if (output / "best.pt").exists():
+        raise FileExistsError(f"Choose a new output directory; best.pt already exists in {output}")
+
+    train_rows, val_rows = read_rows(args)
+    if {row["label"] for row in train_rows} != set(LABELS[args.task]):
+        raise ValueError("Training split must contain every task label for class-balanced batches")
+    encoder, report = make_lora_encoder(args.model_id, args.revision, device, args.lora)
+    classifier = classifier_type(args.classifier)(encoder.hidden_size, len(LABELS[args.task])).to(device)
+    report["trainable"] = trainable_report(encoder)
+    save_json(output / "model_inspection.json", report)
+
+    dataset = FullAudioTwoViewDataset(
+        train_rows, encoder.processor.sampling_rate, seconds=FULL_SECONDS,
+        transform=make_audio_augmentation(encoder.processor.sampling_rate, FULL_SECONDS))
+    sampler = ClassBalancedBatchSampler(
+        train_rows, args.classes_per_batch, args.recordings_per_class, args.batches_per_epoch)
+    loader = DataLoader(dataset, batch_sampler=sampler, num_workers=0)
+    groups = parameter_groups(encoder.named_parameters(), args.adapter_lr, args.weight_decay)
+    groups += parameter_groups(classifier.named_parameters(), args.classifier_lr,
+                               args.classifier_weight_decay)
+    optimizer = torch.optim.AdamW(groups)
+    save_json(output / "ce_config.json", vars(args) | {
+        "seconds": FULL_SECONDS,
+        "view_policy": "full_30s_recording_independent_augmentations",
+        "revision": encoder.revision,
+        "labels": LABELS[args.task],
+        "package_versions": package_versions(),
+    })
+
+    best_key = (-1.0, float("-inf"))
+    stale = 0
+    history = []
+    for epoch in range(1, args.ce_epochs + 1):
+        encoder.train()
+        classifier.train()
+        # Match train_lora.py: freeze the backbone for warmup, then optimize
+        # only LoRA adapters together with the classifier.
+        for name, parameter in encoder.named_parameters():
+            parameter.requires_grad_(epoch > args.ce_warmup and "lora_" in name)
+
+        loss_sum = 0.0
+        for view1, view2, labels in loader:
+            waveforms = torch.cat((view1, view2), dim=0).to(device)
+            targets = torch.cat((labels, labels), dim=0).to(device)
+            optimizer.zero_grad(set_to_none=True)
+            with device_autocast(device):
+                embeddings = forward_h(encoder, waveforms)
+                logits = classifier(embeddings)
+                loss = F.cross_entropy(logits.float(), targets)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                [p for p in encoder.parameters() if p.requires_grad]
+                + list(classifier.parameters()), 1.0)
+            optimizer.step()
+            loss_sum += loss.item()
+
+        encoder.eval()
+        classifier.eval()
+        h_val = extract_full_embeddings(
+            val_rows, encoder, args.extract_batch_size, device).to(device)
+        y_val = torch.tensor([row["label_index"] for row in val_rows],
+                             dtype=torch.long, device=device)
+        with torch.no_grad():
+            logits = classifier(h_val).float().cpu()
+            loss = F.cross_entropy(logits, y_val.cpu()).item()
+        score = metrics(logits, y_val.cpu(), LABELS[args.task]) | {"loss": loss}
+        key = (score["top1"], -score["loss"])
+        train_loss = loss_sum / len(loader)
+        history.append({"epoch": epoch, "train_loss": train_loss, **score})
+        print(f"epoch={epoch} ce_train_loss={train_loss:.5f} {score}", flush=True)
+
+        if key > best_key:
+            best_key, stale = key, 0
+            checkpoint = {
+                "format_version": 2,
+                "kind": "mert_lora_ce_30s",
+                "task": args.task,
+                "labels": LABELS[args.task],
+                "model_id": args.model_id,
+                "revision": encoder.revision,
+                "adapter_state": {k: v.detach().cpu() for k, v in
+                                  get_peft_model_state_dict(encoder.backbone).items()},
+                "classifier_state": {k: v.detach().cpu() for k, v in classifier.state_dict().items()},
+                "classifier": args.classifier,
+                "model_args": {"input_dim": encoder.hidden_size,
+                               "num_classes": len(LABELS[args.task])},
+                "lora": args.lora,
+                "seconds": FULL_SECONDS,
+                "view_policy": "full_30s_recording_independent_augmentations",
+                "pooling": "feature_attention_mask_mean",
+                "metrics": score,
+                "epoch": epoch,
+                "seed": args.seed,
+                "train_ids": [row["sample_id"] for row in train_rows],
+                "validation_ids": [row["sample_id"] for row in val_rows],
+                "package_versions": package_versions(),
+            }
+            torch.save(checkpoint, output / "best.pt")
+            save_json(output / "validation_metrics.json", score | {"epoch": epoch})
+            save_confusion(score, output / "validation_confusion.png")
+        else:
+            stale += 1
+        if stale >= args.classifier_patience:
+            break
+
+    save_json(output / "history.json", history)
+    best_checkpoint = torch.load(output / "best.pt", map_location="cpu", weights_only=True)
+    set_peft_model_state_dict(encoder.backbone, best_checkpoint["adapter_state"])
+    print(f"Best CE checkpoint: {output / 'best.pt'} (epoch={best_checkpoint['epoch']}, "
+          f"metrics={best_checkpoint['metrics']})", flush=True)
+    if args.visualize:
+        visualize_full_recordings(args, encoder, None, train_rows + val_rows, output,
+                                  prefix="lora_30s_ce")
+
+
 def main():
     load_dotenv()
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", nargs="?", choices=["stage1", "probe"], default="stage1")
+    parser.add_argument("mode", nargs="?", choices=["stage1", "probe", "ce"], default="stage1")
     parser.add_argument("--task", choices=LABELS, required=True)
     parser.add_argument("--data-root", default="data/raw")
     parser.add_argument("--manifest")
@@ -355,6 +484,8 @@ def main():
     parser.add_argument("--classifier-batch-size", type=int, default=64)
     parser.add_argument("--classifier-epochs", type=int, default=50)
     parser.add_argument("--classifier-patience", type=int, default=15)
+    parser.add_argument("--ce-epochs", type=int, default=50)
+    parser.add_argument("--ce-warmup", type=int, default=4)
     add_visualization_args(parser)
     args = parser.parse_args()
 
@@ -371,7 +502,7 @@ def main():
         if args.classes_per_batch != len(LABELS[args.task]):
             parser.error(f"classes-per-batch must be {len(LABELS[args.task])} for task {args.task}")
         train(args)
-    else:
+    elif args.mode == "probe":
         if not args.stage1:
             parser.error("probe mode requires --stage1")
         if min(args.extract_batch_size, args.classifier_batch_size,
@@ -380,6 +511,17 @@ def main():
         if args.classifier_lr <= 0 or args.classifier_weight_decay < 0 or args.std_floor <= 0:
             parser.error("classifier lr and std-floor must be positive; weight decay must be non-negative")
         run_probe(args)
+    else:
+        if min(args.extract_batch_size, args.classes_per_batch,
+               args.recordings_per_class, args.ce_epochs, args.classifier_patience) < 1:
+            parser.error("batch sizes, CE epochs, recordings per class, and patience must be positive")
+        if args.classes_per_batch != len(LABELS[args.task]):
+            parser.error(f"classes-per-batch must be {len(LABELS[args.task])} for task {args.task}")
+        if args.ce_warmup < 0 or args.classifier_lr <= 0 or args.classifier_weight_decay < 0:
+            parser.error("CE warmup must be non-negative; classifier lr positive and weight decay non-negative")
+        if args.adapter_lr <= 0 or args.weight_decay < 0:
+            parser.error("adapter lr must be positive and weight decay non-negative")
+        train_ce(args)
 
 
 if __name__ == "__main__":
