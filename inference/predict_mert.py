@@ -14,7 +14,7 @@ from common import (
     write_predictions,
 )
 from features import extract_features
-from models import MERTEncoder, MLPClassifier
+from models import MERTEncoder, MLPClassifier, NonLinearClassifier
 from utils import LABELS, get_device
 
 
@@ -38,8 +38,13 @@ def main():
     ):
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
         validate_checkpoint_task(checkpoint, task, checkpoint_path)
-        if checkpoint.get("format_version") != 1 or "state_dict" not in checkpoint:
-            raise ValueError(f"Expected a train.py/train_contrastive.py MLP checkpoint: {checkpoint_path}")
+        is_two_stage = checkpoint.get("kind") == "mert_contrastive_two_stage"
+        if is_two_stage:
+            required = {"projection_args", "projection_state", "classifier_args", "classifier_state"}
+            if checkpoint.get("format_version") != 2 or not required.issubset(checkpoint):
+                raise ValueError(f"Invalid two-stage contrastive checkpoint: {checkpoint_path}")
+        elif checkpoint.get("format_version") != 1 or "state_dict" not in checkpoint:
+            raise ValueError(f"Expected a train.py/train_contrastive.py checkpoint: {checkpoint_path}")
         rows = load_test_rows(args.data_root, task, manifest)
         validate_no_training_overlap(checkpoint, rows, checkpoint_path)
 
@@ -55,14 +60,26 @@ def main():
         features = extract_features(
             rows, encoder, args.cache_dir, checkpoint["model_id"],
             checkpoint["seconds"], args.extract_batch_size)
-        model = MLPClassifier(**checkpoint["model_args"])
-        model.load_state_dict(checkpoint["state_dict"], strict=True)
-        model.to(device).eval()
         with torch.no_grad():
-            logits = torch.cat([
-                model(batch.to(device)).cpu()
-                for batch in features.split(args.batch_size)
-            ])
+            if is_two_stage:
+                projection = MLPClassifier(**checkpoint["projection_args"])
+                projection.load_state_dict(checkpoint["projection_state"], strict=True)
+                classifier = NonLinearClassifier(**checkpoint["classifier_args"])
+                classifier.load_state_dict(checkpoint["classifier_state"], strict=True)
+                projection.to(device).eval()
+                classifier.to(device).eval()
+                logits = torch.cat([
+                    classifier(projection.encode(batch.to(device))).cpu()
+                    for batch in features.split(args.batch_size)
+                ])
+            else:
+                model = MLPClassifier(**checkpoint["model_args"])
+                model.load_state_dict(checkpoint["state_dict"], strict=True)
+                model.to(device).eval()
+                logits = torch.cat([
+                    model(batch.to(device)).cpu()
+                    for batch in features.split(args.batch_size)
+                ])
         top3 = rank_predictions(logits, checkpoint["labels"])
         predictions[f"dataset_{task}"] = {
             row["sample_id"]: ranked for row, ranked in zip(rows, top3)

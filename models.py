@@ -89,9 +89,9 @@ class LinearClassifier(nn.Module):
 
 
 class NonLinearClassifier(nn.Module):
-    def __init__(self, dim=1024, classes=6):
+    def __init__(self, dim=1024, classes=6, hidden_dim=512):
         super().__init__()
-        self.net = nn.Sequential(nn.Linear(dim, 512), nn.GELU(), nn.Linear(512, classes))
+        self.net = nn.Sequential(nn.Linear(dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, classes))
 
     def forward(self, x):
         return self.net(x)

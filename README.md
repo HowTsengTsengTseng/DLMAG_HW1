@@ -196,9 +196,16 @@ uv run python train/train.py --task B --output-dir runs/B
 ### Frozen-feature contrastive classifier
 
 ```bash
-uv run python train/train_contrastive.py --task A --output-dir runs/A_contrastive
-uv run python train/train_contrastive.py --task B --output-dir runs/B_contrastive
+uv run python train/train_contrastive.py stage1 \
+  --task A --output-dir runs/A_contrastive_stage1
+uv run python train/train_contrastive.py probe \
+  --task A --stage1 runs/A_contrastive_stage1 --probe-all \
+  --output-dir runs/A_contrastive_probe
 ```
+
+Stage1 saves the projection every five epochs and also saves the final epoch
+when needed. Probe mode accepts one checkpoint, or probes every `epoch_*.pt`
+checkpoint in a directory with `--probe-all`.
 
 ### Audio-SUC
 
