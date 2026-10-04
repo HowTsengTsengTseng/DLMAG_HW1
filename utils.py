@@ -33,7 +33,16 @@ def get_device(name="auto"):
 def save_json(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    def json_default(item):
+        if isinstance(item, (set, frozenset)):
+            return sorted(item, key=str)
+        return str(item)
+
+    path.write_text(
+        json.dumps(value, ensure_ascii=False, indent=2, default=json_default) + "\n",
+        encoding="utf-8",
+    )
 
 
 def metrics(logits, targets, labels):
