@@ -20,7 +20,8 @@ augmentations.py            Audio augmentation helpers
 utils.py                   Labels, metrics, seeding, and plotting
 train/
   train.py                 Frozen MERT features + MLP
-  train_contrastive.py     Frozen MERT features + contrastive classifier
+  train_contrastive.py     Full-audio contrastive training and probing
+  train_contrastive_crops.py 10-second crop contrastive training and probing
   train_audiosuc.py        Audio-SUC training workflow
   train_lora.py            10-second LoRA stage1, probe, and CE workflows
   train_lora_30s.py        30-second LoRA stage1 and probe workflows
@@ -206,6 +207,18 @@ uv run python train/train_contrastive.py probe \
 Stage1 saves the projection every five epochs and also saves the final epoch
 when needed. Probe mode accepts one checkpoint, or probes every `epoch_*.pt`
 checkpoint in a directory with `--probe-all`.
+
+The full-audio workflow uses `train/train_contrastive.py`. The crop workflow
+is kept in a separate script so both workflows remain available:
+
+```bash
+uv run python train/train_contrastive_crops.py stage1 \
+  --task A --crop-seconds 10 \
+  --output-dir runs/A_contrastive_10s_stage1
+uv run python train/train_contrastive_crops.py probe \
+  --task A --stage1 runs/A_contrastive_10s_stage1 --probe-all \
+  --output-dir runs/A_contrastive_10s_probe
+```
 
 ### Audio-SUC
 

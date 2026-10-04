@@ -14,6 +14,7 @@ from common import (
     write_predictions,
 )
 from features import extract_features
+from lora_pipeline import fixed_crops, forward_h
 from models import MERTEncoder, MLPClassifier, NonLinearClassifier
 from utils import LABELS, get_device
 
@@ -38,7 +39,11 @@ def main():
     ):
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
         validate_checkpoint_task(checkpoint, task, checkpoint_path)
-        is_two_stage = checkpoint.get("kind") == "mert_contrastive_two_stage"
+        is_two_stage = checkpoint.get("kind") in {
+            "mert_contrastive_two_stage",
+            "mert_contrastive_two_stage_crops",
+        }
+        is_crop_two_stage = checkpoint.get("kind") == "mert_contrastive_two_stage_crops"
         if is_two_stage:
             required = {"projection_args", "projection_state", "classifier_args", "classifier_state"}
             if checkpoint.get("format_version") != 2 or not required.issubset(checkpoint):
@@ -57,9 +62,18 @@ def main():
             encoder = MERTEncoder(*key).to(device).eval()
             encoder_key = key
 
-        features = extract_features(
-            rows, encoder, args.cache_dir, checkpoint["model_id"],
-            checkpoint["seconds"], args.extract_batch_size)
+        if is_crop_two_stage:
+            crops = fixed_crops(
+                rows, encoder.processor.sampling_rate,
+                checkpoint["crop_seconds"])
+            features = torch.cat([
+                forward_h(encoder, batch.to(device)).float().cpu()
+                for batch in crops.split(args.extract_batch_size)
+            ])
+        else:
+            features = extract_features(
+                rows, encoder, args.cache_dir, checkpoint["model_id"],
+                checkpoint["seconds"], args.extract_batch_size)
         with torch.no_grad():
             if is_two_stage:
                 projection = MLPClassifier(**checkpoint["projection_args"])
@@ -80,6 +94,9 @@ def main():
                     model(batch.to(device)).cpu()
                     for batch in features.split(args.batch_size)
                 ])
+        if is_crop_two_stage:
+            probabilities = logits.softmax(-1).reshape(len(rows), 3, -1).mean(1)
+            logits = probabilities.clamp_min(1e-12).log()
         top3 = rank_predictions(logits, checkpoint["labels"])
         predictions[f"dataset_{task}"] = {
             row["sample_id"]: ranked for row, ranked in zip(rows, top3)
