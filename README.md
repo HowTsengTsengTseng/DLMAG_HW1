@@ -386,3 +386,5 @@ this repository.
 - [MERT-v2-30s model card](https://huggingface.co/m-a-p/MERT-v2-30s)
 - [MERT research repository](https://github.com/yizhilll/MERT)
 - [uv documentation](https://docs.astral.sh/uv/)
+- [AudioSUC paper](https://arxiv.org/abs/2407.05368)
+- [CNNv2 reference github repo](https://github.com/Ofir7909/music-classification-pytorch)

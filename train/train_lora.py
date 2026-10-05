@@ -314,7 +314,7 @@ def main():
     p.add_argument("--classifier-batch-size", type=int, default=64);
     p.add_argument("--classifier-epochs", type=int, default=100);
     p.add_argument("--classifier-patience", type=int, default=15);
-    p.add_argument("--ce-epochs", type=int, default=50);
+    p.add_argument("--ce-epochs", type=int, default=100);
     p.add_argument("--ce-warmup", type=int, default=4)
     p.add_argument("--probe-all", action="store_true")
     p.add_argument("--cache-dir", default="data/features")
