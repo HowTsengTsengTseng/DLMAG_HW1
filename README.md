@@ -339,10 +339,14 @@ The ALM evaluation script uses `nvidia/audio-flamingo-3-hf` through the
 Transformers `AutoProcessor` and `AutoModelForSeq2SeqLM` interfaces. It reads
 every sample in the selected `train` or `validation` split for both datasets,
 prompts the model to return its top three task labels, and writes one valid
-top-1 answer for every sample. The default `--prompt-design both` compares:
+top-1 answer for every sample. The default `--prompt-design both` compares two
+JSON-only prompts:
 
-1. a JSON response with a `top3_labels` array;
-2. a `label1 > label2 > label3` response.
+1. `base`: the direct classification prompt;
+2. `compare`: a task-specific comparison prompt. For Dataset B it first asks
+   the model to internally identify lyric language and distinguish UK/England
+   English from US English when the lyrics are English. For Dataset A it asks
+   the model to compare recording-era evidence before selecting a decade.
 
 The parser also accepts an unambiguous Python-style dictionary with single
 quotes because AF3 may produce that form despite a JSON instruction.

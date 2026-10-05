@@ -1,8 +1,8 @@
 """Evaluate NVIDIA Audio Flamingo 3 on labeled dataset splits.
 
-The model is prompted to rank all task labels. This gives both top-1 and
-top-3 metrics from one generation while preserving a valid top-1 answer for
-every sample, including generations that fail the output format.
+The model is prompted to return a JSON top-3 ranking. This gives both top-1
+and top-3 metrics from one generation while preserving a valid top-1 answer
+for every sample, including generations that fail the output format.
 """
 from __future__ import annotations
 
@@ -43,27 +43,52 @@ def manifest_rows(data_root, task, manifest, split):
 def prompt_for(task, labels, design):
     label_text = ", ".join(labels)
     if task == "A":
-        task_description = "the recording's release decade"
+        if design == "base":
+            instruction = (
+                "Estimate the recording's release decade from the audio. "
+                "Use musical style, instrumentation, production, and recording "
+                "characteristics as evidence."
+            )
+        elif design == "compare":
+            instruction = (
+                "Use a two-stage internal comparison: first estimate the era "
+                "suggested by the recording technology, production sound, "
+                "instrumentation, and musical style; then compare the plausible "
+                "decades and select the most likely release decade. Do not output "
+                "your analysis."
+            )
+        else:
+            raise ValueError(f"Unknown prompt design: {design}")
+    elif task == "B":
+        if design == "base":
+            instruction = (
+                "Estimate the recording's release market/country from the audio. "
+                "Use vocals, lyrics, language, accent, musical style, and "
+                "production as evidence."
+            )
+        elif design == "compare":
+            instruction = (
+                "First identify the language of the lyrics internally. If the "
+                "lyrics are English, pay special attention to accent and speech "
+                "pronunciation to distinguish UK/England English from US English. "
+                "If the lyrics are not English, use the language, accent, musical "
+                "style, and production as evidence for the release market/country. "
+                "Do not output this intermediate analysis."
+            )
+        else:
+            raise ValueError(f"Unknown prompt design: {design}")
     else:
-        task_description = "the recording's release market/country"
-    if design == "json":
-        return (
-            "Listen to the audio and estimate {description}. "
-            "Choose only from these labels: {labels}.\n"
-            "Return ONLY this JSON object, using double quotes and exactly "
-            "three labels: {{\"top3_labels\":[\"label1\",\"label2\",\"label3\"]}}.\n"
-            "Order the three labels from most likely to least likely. "
-            "Do not output all six labels, explanations, markdown, or extra text."
-        ).format(description=task_description, labels=label_text)
-    if design == "ranked":
-        return (
-            "Listen to the audio and estimate {description}. "
-            "Allowed labels: {labels}.\n"
-            "Output exactly three labels, in descending likelihood, separated "
-            "by >. Do not output all six labels, explanations, or extra text. "
-            "Example: label1 > label2 > label3"
-        ).format(description=task_description, labels=label_text)
-    raise ValueError(f"Unknown prompt design: {design}")
+        raise ValueError(f"Unknown task: {task}")
+
+    return (
+        "Listen to the audio. " + instruction + "\n"
+        "The only allowed labels are: {labels}.\n"
+        "Return ONLY a valid JSON object using double quotes and exactly this "
+        "schema: {{\"top3_labels\":[\"label1\",\"label2\",\"label3\"]}}.\n"
+        "The three labels must be allowed labels, must be distinct, and must be "
+        "ordered from most likely to least likely. Do not output all six labels, "
+        "reasoning, markdown, or any extra text."
+    ).format(labels=label_text)
 
 
 def normalize_label(value, labels):
@@ -93,42 +118,37 @@ def parse_output(text, labels, design):
     """Return a complete ranking, validity, and a human-readable reason."""
     candidates = []
     reason = "ok"
-    if design == "json":
+    try:
+        parsed = json.loads(text.strip())
+        values = None
+        if isinstance(parsed, dict):
+            values = parsed.get("top3_labels", parsed.get("ranked_labels"))
+        if not isinstance(values, list):
+            reason = "missing-top3_labels"
+        else:
+            candidates = [normalize_label(value, labels) for value in values]
+            candidates = [value for value in candidates if value]
+            if len(candidates) < 3 or len(set(candidates)) < 3:
+                reason = "incomplete-or-duplicate-ranking"
+    except (json.JSONDecodeError, TypeError):
+        # AF3 may emit a Python-style dictionary with single quotes even when
+        # JSON was requested. Accept that unambiguous representation while
+        # still requiring three distinct allowed labels.
         try:
-            parsed = json.loads(text.strip())
-            values = None
-            if isinstance(parsed, dict):
-                values = parsed.get("top3_labels", parsed.get("ranked_labels"))
+            parsed = ast.literal_eval(text.strip())
+            values = parsed.get("top3_labels", parsed.get("ranked_labels")) \
+                if isinstance(parsed, dict) else None
             if not isinstance(values, list):
-                reason = "missing-ranked_labels"
+                reason = "missing-top3_labels"
             else:
                 candidates = [normalize_label(value, labels) for value in values]
                 candidates = [value for value in candidates if value]
                 if len(candidates) < 3 or len(set(candidates)) < 3:
                     reason = "incomplete-or-duplicate-ranking"
-        except (json.JSONDecodeError, TypeError):
-            # AF3 frequently emits valid Python-style dictionaries with single
-            # quotes even when JSON was requested. Accept that unambiguous
-            # representation, but still enforce the same label checks.
-            try:
-                parsed = ast.literal_eval(text.strip())
-                values = parsed.get("top3_labels", parsed.get("ranked_labels")) \
-                    if isinstance(parsed, dict) else None
-                if not isinstance(values, list):
-                    reason = "missing-ranked_labels"
                 else:
-                    candidates = [normalize_label(value, labels) for value in values]
-                    candidates = [value for value in candidates if value]
-                    if len(candidates) < 3 or len(set(candidates)) < 3:
-                        reason = "incomplete-or-duplicate-ranking"
-                    else:
-                        reason = "ok-python-literal"
-            except (SyntaxError, ValueError, TypeError):
-                reason = "invalid-json"
-    else:
-        candidates = labels_in_text(text, labels)
-        if len(candidates) < 3:
-            reason = "incomplete-ranking"
+                    reason = "ok-python-literal"
+        except (SyntaxError, ValueError, TypeError):
+            reason = "invalid-json"
 
     unique = []
     for label in candidates:
@@ -253,7 +273,7 @@ def main():
     parser.add_argument("--split", choices=["train", "validation"], default="validation")
     parser.add_argument("--model-id", default=MODEL_ID)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--prompt-design", choices=["json", "ranked", "both"], default="both")
+    parser.add_argument("--prompt-design", choices=["base", "compare", "both"], default="both")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     parser.add_argument("--dtype", choices=["float16", "bfloat16"], default="bfloat16")
     parser.add_argument("--max-new-tokens", type=int, default=32)
@@ -272,7 +292,7 @@ def main():
         "B": manifest_rows(args.data_root, "B", args.manifest_b, args.split),
     }
     processor, model = load_model(args.model_id, device, dtype)
-    designs = [args.prompt_design] if args.prompt_design != "both" else ["json", "ranked"]
+    designs = [args.prompt_design] if args.prompt_design != "both" else ["base", "compare"]
     all_results = {
         "model_id": args.model_id,
         "split": args.split,
