@@ -28,6 +28,9 @@ train/
 inference/
   predict_mert.py          Frozen MERT MLP and contrastive checkpoints
   predict_lora.py          LoRA probe and CE checkpoints
+  predict.py               Mixed-model inference for Dataset A and B
+  validate.py              Classifier validation metrics
+  validate_alm.py          Audio Flamingo 3 zero-shot validation
   common.py                Shared test-manifest and submission helpers
 infer_lora.py              LoRA prediction entry point
 examples/manifest.csv      Manifest format example; contains no real samples
@@ -37,12 +40,14 @@ requirements.txt           Pip-compatible dependency list
 
 ## Setup
 
-Python 3.11 or 3.12 is required. The project pins PyTorch 2.6.0,
-torchaudio 2.6.0, and Transformers 4.53.2. Install the locked dependencies with
+Python 3.11 or 3.12 is required. The project pins PyTorch 2.6.0 and
+torchaudio 2.6.0, and requires Transformers 5.0.0rc1 or newer for the Audio
+Flamingo 3 evaluation. Install the dependencies with
 [uv](https://docs.astral.sh/uv/):
 
 ```bash
-uv sync --frozen
+uv lock
+uv sync
 ```
 
 Alternatively, install with pip:
@@ -327,6 +332,36 @@ IDs; its example rankings are not used as predictions. Choose the inference
 entry point and checkpoint type that match the model being submitted.
 
 ## Model and evaluation notes
+
+### Audio Flamingo 3 zero-shot evaluation
+
+The ALM evaluation script uses `nvidia/audio-flamingo-3-hf` through the
+Transformers `AutoProcessor` and `AutoModelForSeq2SeqLM` interfaces. It reads
+every sample in the selected `train` or `validation` split for both datasets,
+prompts the model to rank all six task labels, and writes one valid top-1
+answer for every sample. The default `--prompt-design both` compares:
+
+1. a strict JSON response with a `ranked_labels` array;
+2. a strict `label1 > label2 > ...` response.
+
+For malformed or incomplete output, the parser records the raw response and
+reason, counts it as invalid, and deterministically falls back to the first
+task label so every sample still has a valid prediction. The report contains
+Top-1, Top-3, invalid-output rate, and a count-based confusion matrix for each
+prompt design and task.
+
+```bash
+uv run python inference/validate_alm.py \
+  --split validation \
+  --prompt-design both \
+  --output reports/audio_flamingo_validation.json
+```
+
+Use `--manifest-a` and `--manifest-b` to override the default manifests. AF3
+expects the local audio path in a chat message and processes audio in
+30-second windows; the script passes each manifest audio file directly to the
+processor. The prompt format follows NVIDIA's official Audio Flamingo 3
+Transformers usage.
 
 The frozen-feature MLP path converts audio to mono, resamples to 24 kHz, and
 uses up to 30 seconds of audio with the frozen MERT-v2 encoder. Its default

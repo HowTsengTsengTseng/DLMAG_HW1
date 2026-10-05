@@ -196,7 +196,8 @@ def run_stage1(args):
 def load_stage1_checkpoint(path, task):
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
     if checkpoint.get("format_version") != 2 or \
-            checkpoint.get("kind") != "mert_contrastive_stage1":
+            (checkpoint.get("kind") != "mert_contrastive_stage1" and \
+            checkpoint.get("kind") != "mert_contrastive_stage1_crops"):
         raise ValueError(f"Expected a stage1 contrastive checkpoint: {path}")
     if checkpoint.get("task") != task:
         raise ValueError(
