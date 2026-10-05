@@ -338,11 +338,14 @@ entry point and checkpoint type that match the model being submitted.
 The ALM evaluation script uses `nvidia/audio-flamingo-3-hf` through the
 Transformers `AutoProcessor` and `AutoModelForSeq2SeqLM` interfaces. It reads
 every sample in the selected `train` or `validation` split for both datasets,
-prompts the model to rank all six task labels, and writes one valid top-1
-answer for every sample. The default `--prompt-design both` compares:
+prompts the model to return its top three task labels, and writes one valid
+top-1 answer for every sample. The default `--prompt-design both` compares:
 
-1. a strict JSON response with a `ranked_labels` array;
-2. a strict `label1 > label2 > ...` response.
+1. a JSON response with a `top3_labels` array;
+2. a `label1 > label2 > label3` response.
+
+The parser also accepts an unambiguous Python-style dictionary with single
+quotes because AF3 may produce that form despite a JSON instruction.
 
 For malformed or incomplete output, the parser records the raw response and
 reason, counts it as invalid, and deterministically falls back to the first

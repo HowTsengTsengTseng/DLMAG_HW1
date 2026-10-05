@@ -7,6 +7,7 @@ every sample, including generations that fail the output format.
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import re
 from pathlib import Path
@@ -41,23 +42,27 @@ def manifest_rows(data_root, task, manifest, split):
 
 def prompt_for(task, labels, design):
     label_text = ", ".join(labels)
+    if task == "A":
+        task_description = "the recording's release decade"
+    else:
+        task_description = "the recording's release market/country"
     if design == "json":
         return (
-            "Listen to the audio and classify it for Dataset {task}. "
-            "Choose from these labels only: {labels}.\n"
-            "Return ONLY a JSON object with this exact schema: "
-            '{{"ranked_labels":["label1","label2",...]}}.\n'
-            "The array must contain every allowed label exactly once, ordered "
-            "from most likely to least likely. Do not include explanations."
-        ).format(task=task, labels=label_text)
+            "Listen to the audio and estimate {description}. "
+            "Choose only from these labels: {labels}.\n"
+            "Return ONLY this JSON object, using double quotes and exactly "
+            "three labels: {{\"top3_labels\":[\"label1\",\"label2\",\"label3\"]}}.\n"
+            "Order the three labels from most likely to least likely. "
+            "Do not output all six labels, explanations, markdown, or extra text."
+        ).format(description=task_description, labels=label_text)
     if design == "ranked":
         return (
-            "Listen to the audio and classify it for Dataset {task}. "
+            "Listen to the audio and estimate {description}. "
             "Allowed labels: {labels}.\n"
-            "Output exactly all allowed labels once, in descending likelihood, "
-            "separated by the character >. Output no explanation and no other "
-            "text. Example format: label1 > label2 > label3 > ..."
-        ).format(task=task, labels=label_text)
+            "Output exactly three labels, in descending likelihood, separated "
+            "by >. Do not output all six labels, explanations, or extra text. "
+            "Example: label1 > label2 > label3"
+        ).format(description=task_description, labels=label_text)
     raise ValueError(f"Unknown prompt design: {design}")
 
 
@@ -91,28 +96,47 @@ def parse_output(text, labels, design):
     if design == "json":
         try:
             parsed = json.loads(text.strip())
-            values = parsed.get("ranked_labels") if isinstance(parsed, dict) else None
+            values = None
+            if isinstance(parsed, dict):
+                values = parsed.get("top3_labels", parsed.get("ranked_labels"))
             if not isinstance(values, list):
                 reason = "missing-ranked_labels"
             else:
                 candidates = [normalize_label(value, labels) for value in values]
                 candidates = [value for value in candidates if value]
-                if len(candidates) != len(labels) or len(set(candidates)) != len(labels):
+                if len(candidates) < 3 or len(set(candidates)) < 3:
                     reason = "incomplete-or-duplicate-ranking"
         except (json.JSONDecodeError, TypeError):
-            reason = "invalid-json"
+            # AF3 frequently emits valid Python-style dictionaries with single
+            # quotes even when JSON was requested. Accept that unambiguous
+            # representation, but still enforce the same label checks.
+            try:
+                parsed = ast.literal_eval(text.strip())
+                values = parsed.get("top3_labels", parsed.get("ranked_labels")) \
+                    if isinstance(parsed, dict) else None
+                if not isinstance(values, list):
+                    reason = "missing-ranked_labels"
+                else:
+                    candidates = [normalize_label(value, labels) for value in values]
+                    candidates = [value for value in candidates if value]
+                    if len(candidates) < 3 or len(set(candidates)) < 3:
+                        reason = "incomplete-or-duplicate-ranking"
+                    else:
+                        reason = "ok-python-literal"
+            except (SyntaxError, ValueError, TypeError):
+                reason = "invalid-json"
     else:
         candidates = labels_in_text(text, labels)
-        if len(candidates) != len(labels):
+        if len(candidates) < 3:
             reason = "incomplete-ranking"
 
     unique = []
     for label in candidates:
         if label not in unique:
             unique.append(label)
-    if reason != "ok" or not unique:
+    if reason not in {"ok", "ok-python-literal"} or len(unique) < 3:
         return list(labels), False, reason or "no-label"
-    return unique, True, "ok"
+    return unique[:3], True, "ok" if reason == "ok" else reason
 
 
 def load_model(model_id, device, dtype):
@@ -232,7 +256,7 @@ def main():
     parser.add_argument("--prompt-design", choices=["json", "ranked", "both"], default="both")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     parser.add_argument("--dtype", choices=["float16", "bfloat16"], default="bfloat16")
-    parser.add_argument("--max-new-tokens", type=int, default=96)
+    parser.add_argument("--max-new-tokens", type=int, default=32)
     args = parser.parse_args()
     if args.max_new_tokens < 1:
         parser.error("max-new-tokens must be positive")
