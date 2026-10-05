@@ -287,6 +287,22 @@ The 10-second LoRA workflow uses three fixed crops and averages their
 probabilities; the 30-second probe uses one full recording per sample. A LoRA
 `stage1` checkpoint has no classifier, so run `probe` or `ce` before prediction.
 
+### Mixed-model inference
+
+`inference/predict.py` is the unified inference entry point. Task A and Task B
+may use different checkpoint families; the checkpoint `kind` selects the
+appropriate LoRA or frozen-MERT pipeline automatically:
+
+```bash
+uv run python inference/predict.py \
+  --checkpoint-a runs/A_lora_probe/best.pt \
+  --checkpoint-b runs/B/best.pt \
+  --output predictions/mixed.json
+```
+
+Use `--manifest-a` or `--manifest-b` when a task uses a non-default test
+manifest. The output keeps both `dataset_A` and `dataset_B` sections.
+
 Both prediction scripts can validate their output against an optional
 assignment template using `--template`. The template is used to check sample
 IDs; its example rankings are not used as predictions. Choose the inference
