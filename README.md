@@ -6,8 +6,8 @@ classification tasks: **Dataset A**, which predicts a recording's decade, and
 MERT feature classifiers, contrastive and Audio-SUC experiments, and LoRA-based
 MERT training workflows.
 
-The repository contains source code and an example manifest only. Audio data,
-model weights, feature caches, and trained checkpoints are not included.
+The selected Task A and Task B checkpoints are included in `best/`. Audio data,
+pretrained MERT weights, and feature caches are not included.
 
 ## Project layout
 
@@ -33,6 +33,9 @@ inference/
   validate_alm.py          Audio Flamingo 3 zero-shot validation
   common.py                Shared test-manifest and submission helpers
 infer_lora.py              LoRA prediction entry point
+best/
+  task_A_best.pt            Selected Task A LoRA + CE checkpoint
+  task_B_best.pt            Selected Task B frozen contrastive checkpoint
 examples/manifest.csv      Manifest format example; contains no real samples
 pyproject.toml, uv.lock    Project dependencies and lockfile
 requirements.txt           Pip-compatible dependency list
@@ -258,7 +261,24 @@ to the requested run directory; use a new directory for each run.
 
 ## Test-set inference
 
-Both inference scripts produce the assignment submission structure: a mapping
+### TL;DR for graders
+
+The `best/` directory contains the selected validation checkpoints: Task A
+uses the MERT LoRA + CE model, and Task B uses the frozen MERT contrastive
+model. From the project root, run:
+
+```bash
+uv run python inference/predict.py \
+  --checkpoint-a best/task_A_best.pt \
+  --checkpoint-b best/task_B_best.pt \
+  --output predictions/b13902135.json
+```
+
+The command reads the official test manifests from `data/raw` by default and
+checks sample IDs against the official prediction template when it is present.
+The first run may download the pinned MERT model revision from Hugging Face.
+
+The prediction scripts produce the assignment submission structure: a mapping
 from each test sample ID to its three highest-ranked labels. By default, test
 manifests are discovered from `data/raw/dataset_{A,B}/manifest.csv` or
 `data/manifests/{A,B}_test.csv` and filtered to the test split. Pass
