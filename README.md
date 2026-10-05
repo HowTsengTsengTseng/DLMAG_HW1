@@ -303,6 +303,24 @@ uv run python inference/predict.py \
 Use `--manifest-a` or `--manifest-b` when a task uses a non-default test
 manifest. The output keeps both `dataset_A` and `dataset_B` sections.
 
+### Validation metrics
+
+Use `inference/validate.py` with the same per-task checkpoints to compute
+recording-level cross-entropy loss, top-1 accuracy, and top-3 accuracy on the
+validation split:
+
+```bash
+uv run python inference/validate.py \
+  --checkpoint-a runs/A_lora_probe/best.pt \
+  --checkpoint-b runs/B/best.pt \
+  --output validation/mixed.json
+```
+
+Validation manifests are discovered from the task manifest and filtered to the
+`validation` split. Pass `--manifest-a` or `--manifest-b` to override them.
+For crop checkpoints, crop probabilities are combined before all metrics are
+calculated.
+
 Both prediction scripts can validate their output against an optional
 assignment template using `--template`. The template is used to check sample
 IDs; its example rankings are not used as predictions. Choose the inference
